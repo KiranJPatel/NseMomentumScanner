@@ -1,0 +1,255 @@
+# NSE Momentum Stock Scanner — Production v3.1
+
+## Contents
+
+| File | Purpose |
+|------|---------|
+| `Program.cs` | C# .NET 8 scanner + live dashboard server — multi-timeframe, SQLite, 30-day history |
+| `NseMomentumScanner.csproj` | .NET 8 project file with all NuGet packages + ASP.NET Core framework reference |
+| `appsettings.json` | Runtime configuration overrides |
+| `nse_dashboard.html` | Self-contained HTML trading dashboard (open directly, or serve live — see below) |
+| `export_dashboard_data.py` | Optional: Python 3 script for a one-off static JSON snapshot (offline use) |
+
+---
+
+## Quick Start
+
+### 1. Run the Scanner
+
+```bash
+# Restore packages and run
+dotnet restore
+dotnet run
+```
+
+The scanner will:
+- Scan Nifty 200 + SMID + New Listings (~490 tickers)
+- Score last 30 days across 6 timeframes: 1mo · 1wk · 1d · 1h · 15m · 5m
+- Save everything to `NseMomentumScanner.db` (SQLite)
+- Write day-wise CSVs to `data/` folder
+- Display last-day aggregated results on console
+
+Optional flags:
+```bash
+dotnet run -- --help        # show all options
+dotnet run -- --dry-run     # validate DB + config, then exit
+```
+
+### 2. View the Dashboard — Live, Reading Directly From the DB
+
+```bash
+dotnet run -- --serve                 # http://localhost:5080
+dotnet run -- --serve --port=8080     # custom port
+dotnet run -- --serve --host=0.0.0.0  # allow access from other devices on your LAN
+```
+
+**Important: open the URL it prints (e.g. `http://localhost:5080`) in your browser — do not
+just double-click `nse_dashboard.html` on disk.** Opening the file directly uses the `file://`
+protocol, which browsers block from fetching local data for security reasons, so it can only
+ever show demo data no matter how many scans you've run. If you do this, the dashboard now
+shows a banner explaining exactly that, instead of silently sitting on demo data.
+
+This starts a small local web server that:
+- Serves `nse_dashboard.html` at `/` (read fresh from disk on every request, so you can edit
+  it without restarting the server)
+- Serves `/dashboard_data.json` **built fresh from the SQLite DB on every request** — no
+  export step, no stale snapshot. It's safe to run `--serve` at the same time as a scan is
+  in progress (SQLite WAL mode allows concurrent reads while the scanner writes).
+- Serves `/api/health` — a quick JSON status check (resolved DB path, whether it exists, and
+  how many scan sessions are in it) if you want to confirm the server is looking at the right
+  database.
+- Prints the resolved DB path and session count to the console at startup, so a wrong working
+  directory or an empty database is obvious immediately rather than something you have to
+  guess at from the browser.
+- The dashboard auto-refreshes every 30 seconds and shows a live "updated HH:MM:SS" indicator
+  in the header. If it can't load live data — server not running, DB not found yet, no scans
+  in it — it now shows a banner explaining specifically why, instead of quietly staying on
+  demo data with no explanation.
+
+Note: `--serve` only serves the dashboard page and the two JSON endpoints above — it does not
+expose the rest of the working directory (earlier builds served the whole folder as static
+files, which both risked a stale `dashboard_data.json` silently shadowing the live endpoint and
+needlessly exposed the raw SQLite DB / `appsettings.json` over HTTP; this is now fixed).
+
+You generally don't need `export_dashboard_data.py` or a static `dashboard_data.json` anymore —
+that script is kept only as an optional way to produce a one-off, fully offline snapshot
+(e.g. to email someone a fixed point-in-time view). Without `--serve` and without a
+`dashboard_data.json` file present, opening `nse_dashboard.html` directly falls back to
+built-in demo data so you can still explore the UI.
+
+---
+
+## Configuration (`appsettings.json`)
+
+```json
+{
+  "ScanHistoryDays":       30,
+  "MaxConcurrentFetches":   2,
+  "TopBuyCount":           30,
+  "TopSellCount":          20,
+  "KeepSessionCount":      10,
+  "DbPath":  "NseMomentumScanner.db",
+  "CsvBaseDir": "data",
+  "SkipWeekends": true,
+  "SkipHolidays": true,
+  "DashboardPort": 5080,
+  "DashboardHost": "localhost"
+}
+```
+
+---
+
+## NuGet Packages Required
+
+```xml
+Microsoft.Data.Sqlite       8.*   (SQLite — Microsoft-official)
+Skender.Stock.Indicators    2.*   (technical indicators)
+Serilog                     3.*
+Serilog.Sinks.Console       4.*
+Serilog.Sinks.File          5.*
+CsvHelper                  33.*
+```
+
+---
+
+## Output Structure
+
+```
+NseMomentumScanner.db          ← full SQLite database
+scanner.log                    ← rolling daily log (kept 7 days)
+data/
+  scan_YYYY-MM-DD_1d.csv       ← daily TF results per day
+  scan_YYYY-MM-DD_1h.csv       ← hourly TF results per day
+  scan_YYYY-MM-DD_15m.csv
+  scan_YYYY-MM-DD_5m.csv
+  scan_YYYY-MM-DD_1wk.csv
+  aggregated_YYYY-MM-DD.csv    ← cross-TF composite scores + recommendations
+dashboard_data.json            ← generated by export_dashboard_data.py
+```
+
+---
+
+## SQLite Tables
+
+| Table | Contents |
+|-------|---------|
+| `scan_sessions` | Run metadata (timestamp, universe, counts) |
+| `scan_results` | Every ticker × timeframe × date score + all 50+ indicator columns |
+| `aggregated_results` | Cross-TF composite score, price levels, supertrend metrics, BUY/SELL tag |
+
+---
+
+## Dashboard Panels
+
+| Panel | Shows |
+|-------|-------|
+| Dashboard | Top-8 buys/sells, score histogram, TF alignment, sector bias |
+| Buy Signals | Sortable table: 30 buy candidates with all metrics |
+| Sell Signals | Sortable table: 20 immediate-sell candidates |
+| Score Matrix | Color-coded grid (every stock × every timeframe) |
+| Price Levels | 52-week · Quarterly · Monthly · Weekly H/L with % distances |
+| Supertrend | Days in trend · Last flip · HH / HL / LH / LL + days-ago |
+
+Click any row for a full stock detail modal with score breakdown,
+range meters, supertrend analysis, and links to NSE + Yahoo charts.
+
+---
+
+## Production Features (v3.0 vs v2.0)
+
+- Fixed M&M/J&KBANK URL encoding (was double-encoding `&`)
+- Fixed supertrend flip window off-by-one error
+- Fixed `GetSma` compile error — now manual O(n) rolling average
+- HTTP 429 / Retry-After handling with full-jitter exponential backoff
+- NSE market calendar (weekends + national holidays)
+- Data quality validator (stale, sparse, OHLC integrity)
+- `appsettings.json` runtime config
+- SQLite PRAGMA: `foreign_keys`, `temp_store=MEMORY`, `mmap_size=256MB`
+- Session pruning — keeps last N sessions, auto-VACUUMs
+- Live progress bar (cursor-repositioned, no console flood)
+- `--help` and `--dry-run` CLI flags
+- Zero `List.GetRange` allocations in hot scoring loop
+
+## Production Readiness Changes (v3.1)
+
+- **Fixed a DB-write bug that would have thrown on the first insert.** Every SQL parameter
+  (including text columns like `symbol`, `scan_date`, `timeframe`) was pre-declared as
+  `SqliteType.Real`, forcing a numeric-conversion bind. Parameter type is now inferred per row.
+- **Fixed a single-ticker failure aborting the entire scan.** A thin-history new listing or an
+  indicator edge case could throw inside `Parallel.ForEachAsync` and cancel the whole run —
+  losing the CSV export, aggregation, and console report for every other ticker already scored.
+  Failures are now caught and logged per ticker+timeframe; the scan keeps going.
+- **Fixed silent split/bonus corruption of every indicator.** The code asked Yahoo for
+  `includeAdjustedClose=true` but never used it — a stock split showed up as a 50%+ single-bar
+  "crash" in raw OHLC, which would trigger false Supertrend flips, false breakdown scores, and
+  distorted price-level percentages around the split date. OHLC is now back-adjusted using the
+  adjusted-close ratio when available.
+- **Real-time dashboard.** New `--serve` mode hosts the dashboard and a live `/dashboard_data.json`
+  endpoint that queries the SQLite DB directly on every request, with the dashboard
+  auto-refreshing every 30s. Replaces the need to manually run the Python export step.
+- **Fixed a BUY/SELL inconsistency in the dashboard.** The dashboard was independently
+  re-deriving "top buy/sell" using different score thresholds than the backend's actual
+  `recommendation` tag (which also respects `TopBuyCount`/`TopSellCount`). It now uses the
+  backend's tag as the single source of truth.
+- Parameterized the session-pruning query instead of string-interpolating the LIMIT value.
+
+## Production Readiness Changes (v3.2)
+
+- **Fixed a bug where weekly scans have been silently returning zero results.** Weekly's
+  lookback window (730 days ≈ 104 weekly bars) could never reach the 175-bar minimum the
+  code required before it would score a single date — so every prior weekly scan quietly
+  produced nothing. Weekly and monthly now have their own, correctly-sized minimum-bar
+  thresholds (they don't run VCP, so they never needed the daily+VCP figure of 175), and a
+  long enough lookback window to actually clear them (weekly: 3 years, monthly: 10 years).
+- **Added monthly (`1mo`) OHLC as a full 6th timeframe** — wired through everywhere the
+  other 5 are: scoring, aggregation, the SQLite schema (`aggregated_results.monthly_score`),
+  CSV export, the console tables, and the dashboard (columns, TF-alignment chart, detail
+  modal). Composite weights were rebalanced: `1mo=0.10, 1wk=0.15, 1d=0.30, 1h=0.20, 15m=0.15,
+  5m=0.10` (previously `1wk=0.15, 1d=0.35, 1h=0.25, 15m=0.15, 5m=0.10`).
+- **Fixed a staleness-check bug that would have affected weekly/monthly too.** The "is this
+  data too old" check used one flat threshold sized for daily bars — a monthly bar dated the
+  1st of the month would have been wrongly flagged stale for the rest of the month. The
+  threshold now scales with each timeframe's own period.
+- **Added a small opt-out disk cache for weekly/monthly fetches** (`CacheEnabled`,
+  `SlowTfCacheHours` in `appsettings.json`, default 6h). Those bars barely change within a
+  day, and the new monthly timeframe adds ~20% more Yahoo requests overall — this keeps
+  same-day re-runs fast without extra API load. Daily/intraday are always fetched live.
+
+## Production Readiness Changes (v3.3)
+
+- **Fixed the dashboard silently showing demo data with no explanation.** Two causes, both
+  fixed:
+  1. `--serve` previously served the *entire working directory* as static files (via
+     `UseStaticFiles`). That could silently shadow the live `/dashboard_data.json` endpoint
+     with a stale static file of the same name (e.g. left over from the legacy Python export
+     script) — the exact bug that makes "live" data look permanently stuck. It also exposed
+     the raw SQLite DB and `appsettings.json` over unauthenticated HTTP. Replaced with three
+     explicit, safe routes (`/`, `/dashboard_data.json`, `/api/health`) and nothing else.
+  2. Opening `nse_dashboard.html` directly (`file://`) rather than via the printed
+     `http://localhost:5080` URL can only ever show demo data — browsers block `file://`
+     pages from fetching local data. The dashboard now detects this and shows a banner
+     explaining it, instead of failing silently.
+- `--serve` now prints the resolved DB path, whether it exists, and the scan-session count at
+  startup, so a wrong working directory or an empty database is obvious in the console
+  immediately. A new `/api/health` endpoint exposes the same info on demand.
+- When live data fails to load for any other reason (server unreachable, no scans in the DB
+  yet, etc.), the dashboard now shows the *actual* reason in a banner and in the browser
+  console, instead of quietly falling back to demo data with no indication why.
+
+## Known Limitations / Suggested Next Steps
+
+- **This environment has no internet access to NuGet or a .NET SDK**, so these changes could
+  not be compiled here. They've been reviewed carefully by hand, but please run
+  `dotnet restore && dotnet build` (and `dotnet run -- --dry-run`) locally before relying on
+  this in production.
+- `sector` is always reported as `"—"` in the dashboard — the scanner doesn't capture sector
+  data. If sector-based analysis matters to you, that would need a small static
+  symbol→sector lookup table added to the universe definitions.
+- The daily-bar timestamp handling (`isIntraday` bars are shifted +5:30 to IST; daily bars are
+  left as returned by Yahoo) wasn't changed in this pass — it's worth spot-checking a few
+  symbols' daily bar dates against the NSE bhavcopy if exact trading-day alignment matters to you.
+- For further modularization (e.g. splitting into the layered Domain/Infrastructure/API project
+  structure you've used on other projects), this single-file `Program.cs` can be split along its
+  existing region boundaries (Config, Models, Fetcher, Analytics, Database, Dashboard, Reporting)
+  without changing behavior — happy to do that as a follow-up if you'd like it as separate projects.
+
