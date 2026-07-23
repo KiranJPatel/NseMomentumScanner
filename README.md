@@ -235,21 +235,3 @@ range meters, supertrend analysis, and links to NSE + Yahoo charts.
 - When live data fails to load for any other reason (server unreachable, no scans in the DB
   yet, etc.), the dashboard now shows the *actual* reason in a banner and in the browser
   console, instead of quietly falling back to demo data with no indication why.
-
-## Known Limitations / Suggested Next Steps
-
-- **This environment has no internet access to NuGet or a .NET SDK**, so these changes could
-  not be compiled here. They've been reviewed carefully by hand, but please run
-  `dotnet restore && dotnet build` (and `dotnet run -- --dry-run`) locally before relying on
-  this in production.
-- `sector` is always reported as `"—"` in the dashboard — the scanner doesn't capture sector
-  data. If sector-based analysis matters to you, that would need a small static
-  symbol→sector lookup table added to the universe definitions.
-- The daily-bar timestamp handling (`isIntraday` bars are shifted +5:30 to IST; daily bars are
-  left as returned by Yahoo) wasn't changed in this pass — it's worth spot-checking a few
-  symbols' daily bar dates against the NSE bhavcopy if exact trading-day alignment matters to you.
-- For further modularization (e.g. splitting into the layered Domain/Infrastructure/API project
-  structure you've used on other projects), this single-file `Program.cs` can be split along its
-  existing region boundaries (Config, Models, Fetcher, Analytics, Database, Dashboard, Reporting)
-  without changing behavior — happy to do that as a follow-up if you'd like it as separate projects.
-
