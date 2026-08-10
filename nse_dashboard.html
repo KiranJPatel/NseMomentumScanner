@@ -169,6 +169,20 @@ tr:hover td{background:var(--bg2);cursor:pointer}
 .sym-link{color:var(--text1);font-weight:500;font-size:12px}
 .rank-badge{width:22px;height:22px;border-radius:50%;background:var(--bg3);color:var(--text2);
             font-size:10px;display:flex;align-items:center;justify-content:center}
+
+/* ── v4.0: regime banner + quality badges ── */
+.regime-banner{display:flex;align-items:center;gap:18px;flex-wrap:wrap;background:var(--bg1);
+               border:1px solid var(--border);border-radius:var(--r);padding:12px 16px;margin-bottom:16px}
+.regime-pill{display:flex;align-items:center;gap:6px;padding:5px 12px;border-radius:20px;font-size:12px;font-weight:600}
+.regime-bullish{background:var(--green2);color:var(--green)}
+.regime-bearish{background:var(--red2);color:var(--red)}
+.regime-neutral{background:var(--amber2);color:var(--amber)}
+.regime-stat{font-size:11px;color:var(--text2)}
+.regime-stat b{color:var(--text1);font-weight:600}
+.mini-badge{font-size:9px;padding:1px 5px;border-radius:3px;font-weight:600;letter-spacing:.3px}
+.mini-badge-warn{background:var(--amber2);color:var(--amber)}
+.mini-badge-bad{background:var(--red2);color:var(--red)}
+.gate-reason{font-size:10px;color:var(--text3);font-style:italic}
 @media(max-width:700px){.modal-grid{grid-template-columns:1fr}.modal-grid3{grid-template-columns:1fr 1fr}.hdr-meta{display:none}}
 </style>
 </head>
@@ -192,6 +206,9 @@ tr:hover td{background:var(--bg2);cursor:pointer}
 
 <!-- ─── Main wrap ───────────────────────────────────────────────── -->
 <div class="wrap">
+
+  <!-- v4.0: Market regime banner -->
+  <div id="regime-banner"></div>
 
   <!-- Summary cards -->
   <div class="cards" id="summary-cards"></div>
@@ -271,6 +288,35 @@ function mkStock(sym, close, aggScore, stDays, vcpFlag, sector) {
   const vol  = +(close * srnd(50000,2000000,0));
   const avgVol = +(vol / volR);
 
+  // ── v4.0 demo fields: RS rank, liquidity, extension, ATR stop/target ──
+  const rsRank = bull ? Math.round(srnd(55,99)) : Math.round(srnd(1,60));
+  const avgTurnover = avgVol * close;
+  const isLiquid = avgTurnover >= 50000000;
+  const extensionPct = bull ? +srnd(-4,30,1) : +srnd(-20,8,1);
+  const isExtended = extensionPct > 25;
+  const atr = +(close * srnd(0.015,0.045)).toFixed(2);
+  const suggestedStop = +(close - atr*2.5).toFixed(2);
+  const suggestedTarget = +(close + atr*2.5*2.5).toFixed(2);
+  const gateReasons=[];
+  if(bull && rsRank<70) gateReasons.push('weak RS vs Nifty');
+  if(bull && !isLiquid) gateReasons.push('low liquidity');
+  if(bull && isExtended) gateReasons.push('extended from 50-EMA');
+  const gateReason = (aggScore>=20 && aggScore<40 && gateReasons.length) ? gateReasons.join(', ') : '';
+
+  // ── v4.1 demo fields: sector rank, fundamentals, earnings blackout ──
+  const sectorRank = Math.round(srnd(1,99));
+  const hasFundamentals = srnd(0,1) > 0.35; // most demo names have data; some don't, to show the "unknown" path
+  const fundamentals = hasFundamentals ? {
+    pe: +srnd(8,65,1), roePct: +srnd(-5,35,1), debtToEquity: +srnd(0,2.5,2),
+    epsGrowthPct: +srnd(-15,45,1), promoterPledgePct: +srnd(0,1)>0.8 ? +srnd(10,70,1) : 0,
+    hasData: true,
+  } : {pe:null,roePct:null,debtToEquity:null,epsGrowthPct:null,promoterPledgePct:null,hasData:false};
+  const hasUpcomingEarnings = srnd(0,1) > 0.85;
+  const earningsDaysOut = Math.floor(srnd(-2, 45));
+  const nextEarningsDate = hasUpcomingEarnings
+    ? new Date(Date.now() + earningsDaysOut*86400000).toISOString().slice(0,10) : null;
+  const inEarningsBlackout = hasUpcomingEarnings && earningsDaysOut >= 0 && earningsDaysOut <= 3;
+
   return {
     sym, close, aggScore, moSc, wSc, dSc, hSc, m15Sc, m5Sc, bullTf, bearTf:6-bullTf, sector,
     levels:{wH,wL,mH,mL,qH,qL,yH,yL,
@@ -289,6 +335,8 @@ function mkStock(sym, close, aggScore, stDays, vcpFlag, sector) {
     hmaSlow:+(close*(1-srnd(.002,.012))).toFixed(2),
     emaFast:+(close*(1+srnd(-.003,.008))).toFixed(2),
     emaSlow:+(close*(1-srnd(.003,.015))).toFixed(2),
+    rsRank, avgTurnover, isLiquid, extensionPct, isExtended, atr, suggestedStop, suggestedTarget, gateReason,
+    sectorRank, fundamentals, nextEarningsDate, inEarningsBlackout,
     rec: aggScore>=40?"BUY": aggScore<=-30?"IMMEDIATE_SELL":"HOLD"
   };
 }
@@ -350,6 +398,22 @@ const STOCKS = [
 
 // BUYS and SELLS are built dynamically in renderAll()
 
+// v4.0: demo market regime + data-quality summary (overwritten by applyLiveData when live)
+let MARKET_REGIME = {
+  benchmark:'^NSEI', close:24812.3, ema50:24390.1, ema200:23705.6, regime:'BULLISH',
+  breadthTotal:471, breadthBullish:268, breadthBearish:203, breadthPctBullish:56.9,
+};
+let DATA_QUALITY = { totalIssues: 14, byReason: [
+  {reason:'Insufficient warmup history', count:6},
+  {reason:'Too few bars', count:4},
+  {reason:'Fetch/scoring error', count:3},
+  {reason:'Stale data', count:1},
+]};
+
+// v4.1: demo sector rotation + which weight-set produced this session (overwritten by applyLiveData)
+let SECTOR_ROTATION = null; // null => fall back to client-side grouping from STOCKS (see renderDashboard)
+let WEIGHT_SOURCE = 'default';
+
 // ═══════════════════════════════════════════════════════════════
 //  UTILITY HELPERS
 // ═══════════════════════════════════════════════════════════════
@@ -410,6 +474,31 @@ function renderHeader(){
   const liveTag=document.getElementById('live-source');
   if(liveTag && window.SCAN_DATE_LIVE)
     liveTag.textContent='Live DB · '+window.SCAN_DATE_LIVE;
+}
+
+function renderRegimeBanner(){
+  const el = document.getElementById('regime-banner');
+  if (!el) return;
+  const r = MARKET_REGIME;
+  if (!r) { el.innerHTML=''; return; }
+  const cls = r.regime==='BULLISH'?'regime-bullish':r.regime==='BEARISH'?'regime-bearish':'regime-neutral';
+  const icon = r.regime==='BULLISH'?'ti-trending-up':r.regime==='BEARISH'?'ti-trending-down':'ti-minus';
+  const breadthColor = r.breadthPctBullish>=50?'var(--green)':r.breadthPctBullish>=35?'var(--amber)':'var(--red)';
+  const defensive = r.regime==='BEARISH' || (r.breadthTotal>0 && r.breadthPctBullish<40);
+  // v4.1: which weight-set produced this session — "default" or "optimized:2026-08-01:sharpe"
+  const isOptimized = WEIGHT_SOURCE && WEIGHT_SOURCE.startsWith('optimized:');
+  const weightLabel = isOptimized
+    ? `Weights: optimized ${esc(WEIGHT_SOURCE.split(':')[1]||'')} (${esc(WEIGHT_SOURCE.split(':')[2]||'')})`
+    : 'Weights: default';
+  el.innerHTML = `
+    <div class="regime-banner">
+      <span class="regime-pill ${cls}"><i class="ti ${icon}"></i>${esc(r.benchmark||'Nifty 50')}: ${esc(r.regime||'NEUTRAL')}</span>
+      <span class="regime-stat">Close <b>${fNum(r.close,1)}</b> · EMA50 <b>${fNum(r.ema50,1)}</b> · EMA200 <b>${fNum(r.ema200,1)}</b></span>
+      <span class="regime-stat">Breadth <b style="color:${breadthColor}">${r.breadthBullish}/${r.breadthTotal}</b> bullish (${fNum(r.breadthPctBullish,1)}%)</span>
+      <span class="regime-stat" title="Scoring weights currently in effect for this session">
+        <i class="ti ${isOptimized?'ti-chart-line':'ti-adjustments'}"></i> ${weightLabel}</span>
+      ${defensive?`<span class="badge badge-amber"><i class="ti ti-shield-check"></i>Defensive mode: fewer, higher-conviction BUYs today</span>`:''}
+    </div>`;
 }
 
 function renderCards(){
@@ -511,6 +600,32 @@ function renderDashboard(){
       <div class="tbl-wrap"><div class="tbl-head"><span class="tbl-title">Sector Bias</span></div>
         <div style="padding:16px"><div id="sector-list" style="display:flex;flex-direction:column;gap:6px;height:200px;overflow-y:auto"></div>
         </div></div>
+    </div>
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:20px;margin-top:20px">
+      <div class="tbl-wrap">
+        <div class="tbl-head"><span class="tbl-title"><i class="ti ti-filter-question"></i> Near-Miss — scored like a BUY, blocked by a quality gate</span></div>
+        <div style="max-height:220px;overflow-y:auto">${(()=>{
+          const gated = STOCKS.filter(s=>s.gateReason).sort((a,b)=>b.aggScore-a.aggScore).slice(0,10);
+          if(!gated.length) return `<div class="empty" style="padding:20px">No gated near-misses today</div>`;
+          return `<table><tbody>${gated.map(s=>`
+            <tr onclick="openModal('${esc(s.sym)}')">
+              <td style="width:90px"><span class="sym-link">${esc(s.sym.replace('.NS',''))}</span></td>
+              <td style="width:70px">${scoreBarHtml(s.aggScore,100)}</td>
+              <td class="gate-reason">${esc(s.gateReason)}</td>
+            </tr>`).join('')}</tbody></table>`;
+        })()}</div>
+      </div>
+      <div class="tbl-wrap">
+        <div class="tbl-head"><span class="tbl-title"><i class="ti ti-alert-triangle"></i> Data Quality</span></div>
+        <div style="padding:16px">
+          <div class="kv"><span class="kv-key">Tickers skipped this session</span><span class="kv-val">${DATA_QUALITY?.totalIssues ?? 0}</span></div>
+          ${(DATA_QUALITY?.byReason||[]).map(r=>`
+            <div style="display:flex;align-items:center;gap:8px;margin-top:8px">
+              <span style="font-size:11px;color:var(--text2);flex:1">${esc(r.reason)}</span>
+              <span style="font-size:11px;font-weight:600;color:var(--amber)">${r.count}</span>
+            </div>`).join('') || `<div class="empty" style="padding:12px">No issues logged</div>`}
+        </div>
+      </div>
     </div>`;
 
   setTimeout(()=>{
@@ -545,14 +660,21 @@ function renderDashboard(){
                scales:{x:{stacked:true,ticks:{color:'#56708c',font:{size:11}}},
                        y:{stacked:true,ticks:{color:'#56708c',font:{size:11}}}}}
     });
-    // Sector bias
-    const secBias={};
-    STOCKS.forEach(s=>{secBias[s.sector]=(secBias[s.sector]||[]);secBias[s.sector].push(s.aggScore);});
-    const secAvg=Object.entries(secBias).map(([sec,scores])=>[sec,+(scores.reduce((a,b)=>a+b,0)/scores.length).toFixed(1)]);
-    secAvg.sort((a,b)=>b[1]-a[1]);
-    document.getElementById('sector-list').innerHTML=secAvg.map(([sec,avg])=>`
-      <div style="display:flex;align-items:center;gap:8px">
-        <span style="font-size:11px;color:var(--text2);width:90px;flex-shrink:0">${sec}</span>
+    // Sector bias — prefer the server's authoritative sector-rotation rollup (same ranking
+    // used by Config.EnableSectorGate) over a client-side re-derivation from STOCKS.
+    let secAvg;
+    if (SECTOR_ROTATION && SECTOR_ROTATION.length) {
+      secAvg = SECTOR_ROTATION.map(s => [s.sector, s.avgScore, s.count, s.bullish]);
+    } else {
+      const secBias={};
+      STOCKS.forEach(s=>{secBias[s.sector]=(secBias[s.sector]||[]);secBias[s.sector].push(s.aggScore);});
+      secAvg=Object.entries(secBias).map(([sec,scores])=>
+        [sec,+(scores.reduce((a,b)=>a+b,0)/scores.length).toFixed(1), scores.length, scores.filter(v=>v>0).length]);
+      secAvg.sort((a,b)=>b[1]-a[1]);
+    }
+    document.getElementById('sector-list').innerHTML=secAvg.map(([sec,avg,cnt,bull])=>`
+      <div style="display:flex;align-items:center;gap:8px" title="${bull ?? 0}/${cnt ?? 0} bullish">
+        <span style="font-size:11px;color:var(--text2);width:90px;flex-shrink:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(sec)}</span>
         <div style="flex:1;height:6px;background:var(--bg4);border-radius:3px">
           <div style="width:${Math.min(100,Math.max(0,(avg+80)/180*100))}%;height:100%;border-radius:3px;
                background:${avg>=0?'var(--green)':'var(--red)'}"></div>
@@ -616,16 +738,21 @@ function renderBuys(){
     {label:'15m',  val:s=>s.m15Sc},
     {label:'5m',   val:s=>s.m5Sc},
     {label:'TF Align',val:s=>s.bullTf},
+    {label:'RS Rank',val:s=>s.rsRank},
     {label:'Close',val:s=>s.close},
     {label:'vs52wH',val:s=>s.levels.p52H},
     {label:'ST Days',val:s=>s.st.days},
     {label:'ADX',  val:s=>s.adx},
     {label:'Vol×', val:s=>s.volR},
     {label:'VCP',  val:s=>s.vcp?1:0},
+    {label:'Stop / Target',val:s=>s.suggestedStop},
   ];
   const row=s=>`
     <td><span class="rank-badge">${s.rank}</span></td>
-    <td><span class="sym-link">${esc(s.sym.replace('.NS',''))}</span></td>
+    <td><span class="sym-link">${esc(s.sym.replace('.NS',''))}</span>
+        ${s.isExtended?`<span class="mini-badge mini-badge-warn" title="Extended ${fPct(s.extensionPct)} above 50-EMA">EXT</span>`:''}
+        ${!s.isLiquid?`<span class="mini-badge mini-badge-bad" title="Avg turnover below liquidity floor">ILLIQ</span>`:''}
+        ${s.inEarningsBlackout?`<span class="mini-badge mini-badge-warn" title="Earnings due within the blackout window">EARN</span>`:''}</td>
     <td style="color:var(--text3);font-size:11px">${esc(s.sector)}</td>
     <td>${scoreBarHtml(s.aggScore,100)}</td>
     <td style="font-size:11px;color:${scoreColor(s.moSc)}">${s.moSc>0?'+':''}${s.moSc}</td>
@@ -635,13 +762,18 @@ function renderBuys(){
     <td style="font-size:11px;color:${scoreColor(s.m15Sc)}">${s.m15Sc>0?'+':''}${s.m15Sc}</td>
     <td style="font-size:11px;color:${scoreColor(s.m5Sc)}">${s.m5Sc>0?'+':''}${s.m5Sc}</td>
     <td>${'◉'.repeat(s.bullTf)}<span style="color:var(--bg4)">${'◉'.repeat(6-s.bullTf)}</span></td>
+    <td style="font-size:11px;font-weight:600;color:${s.rsRank>=70?'var(--green)':s.rsRank>=50?'var(--amber)':'var(--red)'}">${Math.round(s.rsRank)}</td>
     <td style="text-align:right;font-weight:500">₹${fNum(s.close)}</td>
     <td>${priceMeterHtml(s)}</td>
     <td><span style="color:var(--green);font-size:11px">▲ ${s.st.days}d</span></td>
     <td style="color:${s.adx>=25?'var(--green)':s.adx>=21?'var(--amber)':'var(--text3)'};font-size:11px">
       ${s.adx.toFixed(1)}</td>
     <td style="color:${s.volR>=1.5?'var(--green)':'var(--text2)'};font-size:11px">${s.volR.toFixed(2)}×</td>
-    <td>${s.vcp?'<span class="badge badge-green" style="font-size:10px">VCP</span>':'<span style="color:var(--text3)">—</span>'}</td>`;
+    <td>${s.vcp?'<span class="badge badge-green" style="font-size:10px">VCP</span>':'<span style="color:var(--text3)">—</span>'}</td>
+    <td style="font-size:11px">
+      <span style="color:var(--red)">₹${fNum(s.suggestedStop,1)}</span> /
+      <span style="color:var(--green)">₹${fNum(s.suggestedTarget,1)}</span>
+    </td>`;
   sortableTable('panel-buy', BUYS, 'buy', cols, row);
 }
 
@@ -886,6 +1018,78 @@ function openModal(sym){
         </div>
       </div>
 
+      <!-- Row 1b: v4.0 Risk & Quality -->
+      <div class="modal-section" style="margin-bottom:16px">
+        <div class="modal-section-title">Risk &amp; Quality (v4.0)</div>
+        <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px">
+          <div class="st-metric">
+            <div class="st-metric-label">RS Rank vs Nifty</div>
+            <div class="st-metric-val" style="color:${s.rsRank>=70?'var(--green)':s.rsRank>=50?'var(--amber)':'var(--red)'}">${Math.round(s.rsRank)}</div>
+            <div class="st-metric-sub">${s.rsRank>=70?'Strong':s.rsRank>=50?'Middling':'Lagging'}</div>
+          </div>
+          <div class="st-metric">
+            <div class="st-metric-label">Extension</div>
+            <div class="st-metric-val" style="color:${s.isExtended?'var(--red)':'var(--text1)'}">${fPct(s.extensionPct)}</div>
+            <div class="st-metric-sub">above 50-EMA</div>
+          </div>
+          <div class="st-metric">
+            <div class="st-metric-label">Liquidity</div>
+            <div class="st-metric-val" style="color:${s.isLiquid?'var(--green)':'var(--red)'}">${s.isLiquid?'OK':'Low'}</div>
+            <div class="st-metric-sub">₹${fInt(s.avgTurnover/10000000)}Cr/day</div>
+          </div>
+          <div class="st-metric">
+            <div class="st-metric-label">Suggested Stop</div>
+            <div class="st-metric-val" style="color:var(--red)">₹${fNum(s.suggestedStop,1)}</div>
+            <div class="st-metric-sub">${s.atr?`${(2.5).toFixed(1)}× ATR(${fNum(s.atr,1)})`:'—'}</div>
+          </div>
+          <div class="st-metric">
+            <div class="st-metric-label">Suggested Target</div>
+            <div class="st-metric-val" style="color:var(--green)">₹${fNum(s.suggestedTarget,1)}</div>
+            <div class="st-metric-sub">~2.5:1 R:R</div>
+          </div>
+        </div>
+        ${s.gateReason?`<div style="margin-top:10px;font-size:11px;color:var(--amber)">
+          <i class="ti ti-alert-triangle"></i> Not tagged BUY today — blocked by: ${esc(s.gateReason)}</div>`:''}
+      </div>
+
+      <!-- Row 1c: v4.1 Sector & Fundamentals -->
+      <div class="modal-section" style="margin-bottom:16px">
+        <div class="modal-section-title">Sector &amp; Fundamentals (v4.1)</div>
+        <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px">
+          <div class="st-metric">
+            <div class="st-metric-label">Sector</div>
+            <div class="st-metric-val" style="font-size:13px">${esc(s.sector)}</div>
+            <div class="st-metric-sub" style="color:${s.sectorRank>=70?'var(--green)':s.sectorRank>=40?'var(--amber)':'var(--red)'}">
+              Rank ${Math.round(s.sectorRank)}/99</div>
+          </div>
+          <div class="st-metric">
+            <div class="st-metric-label">P/E</div>
+            <div class="st-metric-val">${s.fundamentals.hasData && s.fundamentals.pe!=null ? s.fundamentals.pe.toFixed(1) : '—'}</div>
+            <div class="st-metric-sub">${s.fundamentals.hasData?'':'no data'}</div>
+          </div>
+          <div class="st-metric">
+            <div class="st-metric-label">ROE</div>
+            <div class="st-metric-val" style="color:${s.fundamentals.roePct!=null && s.fundamentals.roePct<10?'var(--amber)':'var(--text1)'}">
+              ${s.fundamentals.hasData && s.fundamentals.roePct!=null ? s.fundamentals.roePct.toFixed(1)+'%' : '—'}</div>
+            <div class="st-metric-sub">${s.fundamentals.hasData?'':'no data'}</div>
+          </div>
+          <div class="st-metric">
+            <div class="st-metric-label">Debt/Equity</div>
+            <div class="st-metric-val" style="color:${s.fundamentals.debtToEquity!=null && s.fundamentals.debtToEquity>2?'var(--amber)':'var(--text1)'}">
+              ${s.fundamentals.hasData && s.fundamentals.debtToEquity!=null ? s.fundamentals.debtToEquity.toFixed(2) : '—'}</div>
+            <div class="st-metric-sub">${s.fundamentals.hasData?'':'no data'}</div>
+          </div>
+          <div class="st-metric">
+            <div class="st-metric-label">Next Earnings</div>
+            <div class="st-metric-val" style="font-size:13px;color:${s.inEarningsBlackout?'var(--amber)':'var(--text1)'}">
+              ${s.nextEarningsDate ? s.nextEarningsDate : '—'}</div>
+            <div class="st-metric-sub">${s.inEarningsBlackout?'blackout window':''}</div>
+          </div>
+        </div>
+        ${!s.fundamentals.hasData?`<div style="margin-top:10px;font-size:11px;color:var(--text3)">
+          <i class="ti ti-info-circle"></i> No fundamentals on file for this symbol — add a row to data/reference.csv to populate.</div>`:''}
+      </div>
+
       <!-- Row 2: Price levels -->
       <div class="modal-section" style="margin-bottom:16px">
         <div class="modal-section-title">Price Level Context</div>
@@ -1103,6 +1307,13 @@ function applyLiveData(live) {
   // Overwrite SCAN_DATE if present
   if (live.scanDate) window.SCAN_DATE_LIVE = live.scanDate;
 
+  // v4.0: market regime + data-quality summary (null-safe — older server payloads won't have these)
+  if (live.marketRegime) MARKET_REGIME = live.marketRegime;
+  if (live.dataQuality)  DATA_QUALITY  = live.dataQuality;
+  // v4.1
+  if (live.sectorRotation && live.sectorRotation.length) SECTOR_ROTATION = live.sectorRotation;
+  if (live.session && live.session.weightSource) WEIGHT_SOURCE = live.session.weightSource;
+
   // Replace STOCKS with live data
   STOCKS.length = 0;
   (live.stocks || []).forEach(s => {
@@ -1129,6 +1340,23 @@ function applyLiveData(live) {
     s.emaSlow= s.emaSlow ?? s.close;
     s.avgVol = s.avgVol  ?? 0;
     s.sector = s.sector  || '—';
+    // v4.0: relative strength, liquidity, extension, ATR risk levels — default to
+    // non-blocking/neutral when a server payload predates these fields.
+    s.rsRank          = s.rsRank ?? 50;
+    s.avgTurnover     = s.avgTurnover ?? 0;
+    s.isLiquid        = s.isLiquid ?? true;
+    s.extensionPct    = s.extensionPct ?? 0;
+    s.isExtended      = s.isExtended ?? false;
+    s.atr             = s.atr ?? 0;
+    s.suggestedStop   = s.suggestedStop ?? 0;
+    s.suggestedTarget = s.suggestedTarget ?? 0;
+    s.gateReason      = s.gateReason ?? '';
+    // v4.1: sector rotation rank + fundamentals + earnings blackout — default to neutral/unknown
+    // when a server payload predates these fields, exactly like the v4.0 backfill above.
+    s.sectorRank        = s.sectorRank ?? 50;
+    s.fundamentals      = s.fundamentals ?? {pe:null,roePct:null,debtToEquity:null,epsGrowthPct:null,promoterPledgePct:null,hasData:false};
+    s.nextEarningsDate  = s.nextEarningsDate ?? null;
+    s.inEarningsBlackout= s.inEarningsBlackout ?? false;
     STOCKS.push(s);
   });
 }
@@ -1144,6 +1372,7 @@ function renderAll() {
   STOCKS.filter(s=>s.rec==='IMMEDIATE_SELL').sort((a,b)=>a.aggScore-b.aggScore)
         .forEach((s,i)=>{ s.rank=i+1; SELLS.push(s); });
   renderHeader();
+  renderRegimeBanner();
   renderCards();
   renderTabs();
   renderDashboard();

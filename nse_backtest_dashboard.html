@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NSE Momentum Scanner — Backtesting</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.19.0/tabler-icons.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+:root{
+  --bg0:#080d18;--bg1:#0e1525;--bg2:#141e33;--bg3:#1a2540;--bg4:#20304e;
+  --border:#1e2d47;--border2:#2a3d5c;
+  --text1:#e8edf5;--text2:#8fa3c0;--text3:#56708c;
+  --green:#10b981;--green2:#064e3b;
+  --red:#ef4444;--red2:#450a0a;
+  --amber:#f59e0b;--amber2:#451a03;
+  --blue:#3b82f6;--blue2:#1e3a8a;
+  --r:8px;--r2:12px;
+  --font:system-ui,-apple-system,'Segoe UI',sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg0);color:var(--text1);font-family:var(--font);font-size:13px;min-height:100vh}
+a{color:var(--blue);text-decoration:none}
+.hdr{background:var(--bg1);border-bottom:1px solid var(--border);padding:0 20px;height:56px;
+     display:flex;align-items:center;gap:16px;position:sticky;top:0;z-index:100}
+.hdr-logo{font-size:15px;font-weight:600;letter-spacing:-.3px;color:var(--text1)}
+.hdr-logo span{color:var(--blue)}
+.hdr-nav{margin-left:8px;font-size:12px;color:var(--text3)}
+.hdr-meta{font-size:12px;color:var(--text3);margin-left:auto;display:flex;gap:16px;align-items:center}
+.wrap{padding:20px;max-width:1500px;margin:0 auto}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}
+.card{background:var(--bg1);border:1px solid var(--border);border-radius:var(--r);padding:14px 16px}
+.card-label{font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.6px;margin-bottom:6px}
+.card-value{font-size:22px;font-weight:600;line-height:1}
+.green{color:var(--green)}.red{color:var(--red)}.amber{color:var(--amber)}.blue{color:var(--blue)}
+.panel{background:var(--bg1);border:1px solid var(--border);border-radius:var(--r2);padding:18px;margin-bottom:18px}
+.panel h2{font-size:14px;margin-bottom:12px;color:var(--text1);font-weight:600}
+.chart-wrap{position:relative;width:100%;height:220px}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{text-align:left;color:var(--text3);font-weight:600;padding:8px;border-bottom:1px solid var(--border);
+   text-transform:uppercase;font-size:10.5px;letter-spacing:.4px}
+td{padding:7px 8px;border-bottom:1px solid var(--bg3);color:var(--text2)}
+tbody tr:hover{background:var(--bg2);cursor:pointer}
+.btn{background:var(--blue2);color:var(--blue);border:1px solid var(--border2);border-radius:6px;
+     padding:6px 14px;font-size:12px;cursor:pointer;font-family:var(--font)}
+.btn:hover{background:var(--bg3)}
+.empty{padding:40px;text-align:center;color:var(--text3)}
+.filter{width:100%;padding:8px 10px;margin-bottom:10px;border-radius:6px;border:1px solid var(--border2);
+        background:var(--bg0);color:var(--text1);font-family:var(--font)}
+.pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600}
+.pill-green{background:var(--green2);color:var(--green)}
+.pill-red{background:var(--red2);color:var(--red)}
+#detailView{display:none}
+.back{cursor:pointer;color:var(--blue);font-size:12.5px;margin-bottom:14px;display:inline-block}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+@media(max-width:900px){.grid2{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <div class="hdr-logo"><i class="ti ti-chart-candle" style="color:var(--blue)"></i> NSE Momentum <span>Backtesting</span></div>
+  <div class="hdr-nav">Historical simulation of the scanner's own buy/sell signals</div>
+  <div class="hdr-meta"><span id="dbStatus">Loading…</span></div>
+</div>
+
+<div class="wrap">
+
+  <!-- ══════════════ RUNS LIST ══════════════ -->
+  <div id="listView">
+    <div class="panel">
+      <h2>Backtest Runs</h2>
+      <input class="filter" id="runFilter" placeholder="Filter by universe…" oninput="renderRuns()">
+      <table>
+        <thead><tr><th>Run</th><th>When</th><th>Universe</th><th>Period</th><th>Trades</th><th>Return</th><th>Final Equity</th></tr></thead>
+        <tbody id="runsBody"></tbody>
+      </table>
+      <div id="runsEmpty" class="empty" style="display:none">
+        No backtest runs yet. Run <code>dotnet run --backtest</code> (or <code>--mode backtest</code>) to generate one.
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════ RUN DETAIL ══════════════ -->
+  <div id="detailView">
+    <span class="back" onclick="showList()">&larr; Back to all runs</span>
+    <div id="detailHeader" class="panel"></div>
+    <div id="caveatsPanel" class="panel" style="display:none;border-color:var(--amber)"></div>
+    <div id="detailCards" class="cards"></div>
+    <div class="grid2">
+      <div class="panel"><h2>Equity Curve</h2><div class="chart-wrap"><canvas id="eqChart"></canvas></div></div>
+      <div class="panel"><h2>Drawdown</h2><div class="chart-wrap"><canvas id="ddChart"></canvas></div></div>
+    </div>
+    <div class="panel">
+      <h2>Yearly Returns</h2>
+      <table><thead><tr><th>Year</th><th>Return %</th><th>Trades</th></tr></thead><tbody id="yearlyBody"></tbody></table>
+    </div>
+    <div class="panel">
+      <h2>Trade Journal</h2>
+      <input class="filter" id="tradeFilter" placeholder="Filter by symbol…" oninput="renderTrades()">
+      <table>
+        <thead><tr><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>Net P/L</th><th>Return %</th><th>Days</th><th>Exit Reason</th></tr></thead>
+        <tbody id="tradesBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<script>
+let allRuns = [];
+let currentDetail = null;
+let eqChart = null, ddChart = null;
+
+function esc(s){ const d=document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
+function currencySymbolFor(universe){
+  const u = (universe || '').trim().toLowerCase();
+  return (u === 'nasdaq100' || u === 'dowjones' || u === 'usmarket') ? '$' : '₹';
+}
+function money(v, universe){ return currencySymbolFor(universe) + Math.round(v).toLocaleString('en-IN'); }
+function pct(v){ return (v>=0?'+':'') + v.toFixed(2) + '%'; }
+
+async function loadRuns(){
+  try{
+    const res = await fetch('/backtest_data.json');
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    allRuns = data.runs || [];
+    document.getElementById('dbStatus').textContent = allRuns.length + ' run(s) recorded';
+    renderRuns();
+  }catch(e){
+    document.getElementById('dbStatus').textContent = 'Could not load backtest data';
+    document.getElementById('runsEmpty').style.display = 'block';
+    document.getElementById('runsEmpty').textContent = 'Could not reach /backtest_data.json — ' + e.message;
+  }
+}
+
+function renderRuns(){
+  const q = (document.getElementById('runFilter').value || '').toUpperCase();
+  const body = document.getElementById('runsBody');
+  const filtered = allRuns.filter(r => r.universe.toUpperCase().includes(q));
+  body.innerHTML = '';
+  document.getElementById('runsEmpty').style.display = filtered.length ? 'none' : 'block';
+  if (!filtered.length && allRuns.length === 0)
+    document.getElementById('runsEmpty').textContent =
+      'No backtest runs yet. Run `dotnet run --backtest` (or --mode backtest) to generate one.';
+
+  for (const r of filtered){
+    const tr = document.createElement('tr');
+    tr.onclick = () => showDetail(r.runId);
+    const cls = r.returnPct >= 0 ? 'pill-green' : 'pill-red';
+    tr.innerHTML = `<td>#${r.runId}</td><td>${esc(new Date(r.runTimestampUtc).toLocaleString())}</td>
+      <td>${esc(r.universe)}</td><td>${esc(r.startDate)} → ${esc(r.endDate)}</td>
+      <td>${r.totalTrades}</td><td><span class="pill ${cls}">${pct(r.returnPct)}</span></td>
+      <td>${money(r.finalEquity, r.universe)}</td>`;
+    body.appendChild(tr);
+  }
+}
+
+async function showDetail(runId){
+  const res = await fetch('/backtest_data.json?run=' + runId);
+  if (!res.ok) { alert('Could not load run #' + runId); return; }
+  currentDetail = await res.json();
+  document.getElementById('listView').style.display = 'none';
+  document.getElementById('detailView').style.display = 'block';
+  renderDetail();
+}
+
+function showList(){
+  document.getElementById('detailView').style.display = 'none';
+  document.getElementById('listView').style.display = 'block';
+}
+
+function renderDetail(){
+  const d = currentDetail, m = d.metrics;
+  document.getElementById('detailHeader').innerHTML =
+    `<h2>Run #${d.runId} — ${esc(d.universe)}</h2>
+     <div style="color:var(--text3);margin-top:4px">${esc(d.startDate)} → ${esc(d.endDate)} ·
+     ${d.tickerCount} tickers · timeframes: ${esc((d.timeframes||[]).join(', '))}</div>`;
+
+  const caveatsPanel = document.getElementById('caveatsPanel');
+  if (d.caveats && d.caveats.length){
+    caveatsPanel.style.display = 'block';
+    caveatsPanel.innerHTML = '<h2 style="color:var(--amber)"><i class="ti ti-alert-triangle"></i> Notes &amp; Caveats</h2>' +
+      '<ul style="padding-left:18px;line-height:1.7;color:var(--text2)">' +
+      d.caveats.map(c => `<li>${esc(c)}</li>`).join('') + '</ul>';
+  } else {
+    caveatsPanel.style.display = 'none';
+  }
+
+  const cards = [
+    ['Net Profit', money(m.netProfit, d.universe), m.netProfit>=0?'green':'red'],
+    ['Return', pct(m.returnPct), m.returnPct>=0?'green':'red'],
+    ['CAGR', m.cagrPct.toFixed(2)+'%', m.cagrPct>=0?'green':'red'],
+    ['Max Drawdown', '-'+Math.abs(m.maxDrawdownPct).toFixed(2)+'%', 'red'],
+    ['Sharpe', m.sharpeRatio.toFixed(2), ''],
+    ['Sortino', m.sortinoRatio.toFixed(2), ''],
+    ['Win Rate', m.winRatePct.toFixed(1)+'%', ''],
+    ['Profit Factor', isFinite(m.profitFactor)?m.profitFactor.toFixed(2):'∞', ''],
+    ['Total Trades', m.totalTrades, ''],
+    ['Avg Holding Days', m.averageHoldingDays.toFixed(1), ''],
+    ['Total Charges', money(m.totalCharges, d.universe), ''],
+    ['Final Equity', money(m.finalEquity, d.universe), ''],
+  ];
+  document.getElementById('detailCards').innerHTML = cards.map(([label,val,cls]) =>
+    `<div class="card"><div class="card-label">${esc(label)}</div><div class="card-value ${cls}">${val}</div></div>`
+  ).join('');
+
+  const labels = d.equityCurve.map(p => p.date);
+  const eq = d.equityCurve.map(p => p.equity);
+  const dd = d.equityCurve.map(p => -p.drawdownPct);
+
+  if (eqChart) eqChart.destroy();
+  if (ddChart) ddChart.destroy();
+  eqChart = new Chart(document.getElementById('eqChart'), {
+    type:'line',
+    data:{ labels, datasets:[{ data: eq, borderColor:'#3b82f6', backgroundColor:'rgba(59,130,246,0.08)',
+      fill:true, pointRadius:0, borderWidth:2 }] },
+    options:{ responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}},
+      scales:{ x:{ ticks:{ maxTicksLimit:10, color:'#56708c' } }, y:{ ticks:{ color:'#56708c' } } } }
+  });
+  ddChart = new Chart(document.getElementById('ddChart'), {
+    type:'line',
+    data:{ labels, datasets:[{ data: dd, borderColor:'#ef4444', backgroundColor:'rgba(239,68,68,0.12)',
+      fill:true, pointRadius:0, borderWidth:1.5 }] },
+    options:{ responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}},
+      scales:{ x:{ ticks:{ maxTicksLimit:10, color:'#56708c' } }, y:{ max:0, ticks:{ color:'#56708c' } } } }
+  });
+
+  document.getElementById('yearlyBody').innerHTML = (d.yearlyReturns||[]).map(y =>
+    `<tr><td>${esc(y.periodLabel)}</td><td class="${y.returnPct>=0?'green':'red'}">${pct(y.returnPct)}</td><td>${y.trades}</td></tr>`
+  ).join('');
+
+  renderTrades();
+}
+
+function renderTrades(){
+  const q = (document.getElementById('tradeFilter').value || '').toUpperCase();
+  const trades = (currentDetail.trades || []).filter(t => t.symbol.toUpperCase().includes(q));
+  document.getElementById('tradesBody').innerHTML = trades.map(t => `
+    <tr><td>${esc(t.symbol)}</td><td>${esc(t.entryDate).slice(0,10)}</td><td>${esc(t.exitDate).slice(0,10)}</td>
+    <td>${t.quantity}</td><td class="${t.netProfit>=0?'green':'red'}">${money(t.netProfit, currentDetail.universe)}</td>
+    <td class="${t.returnPct>=0?'green':'red'}">${pct(t.returnPct)}</td><td>${t.holdingDays}</td>
+    <td>${esc(t.exitReason)}</td></tr>`).join('');
+}
+
+loadRuns();
+</script>
+</body>
+</html>

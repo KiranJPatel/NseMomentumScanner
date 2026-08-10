@@ -7,28 +7,26 @@
     <Optimize>true</Optimize>
     <AssemblyName>NseMomentumScanner</AssemblyName>
     <RootNamespace>NseMomentumScanner</RootNamespace>
-    <Description>NSE Momentum Scanner · Multi-Timeframe · Production v3.1</Description>
+    <Description>NSE Momentum Scanner · Multi-Timeframe · Production v4.1</Description>
   </PropertyGroup>
   <ItemGroup>
-    <!-- Lets this console app host Kestrel + minimal APIs + static files for
-         the live dashboard server (--serve), with no extra NuGet download —
-         it's part of the .NET SDK's shared framework, not a package. -->
-    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <Compile Remove="Program - Copy.cs" />
   </ItemGroup>
   <ItemGroup>
+    <None Remove="scanner20260721.log" />
+  </ItemGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <None Update="appsettings.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
-    <None Update="nse_dashboard.html">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="Microsoft.Data.Sqlite"          Version="8.*" />
-    <PackageReference Include="Skender.Stock.Indicators"       Version="2.*" />
-    <PackageReference Include="Serilog"                        Version="3.*" />
-    <PackageReference Include="Serilog.Sinks.Console"          Version="4.*" />
-    <PackageReference Include="Serilog.Sinks.File"             Version="5.*" />
-    <PackageReference Include="CsvHelper"                      Version="33.*" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.*" />
+    <PackageReference Include="Skender.Stock.Indicators" Version="2.*" />
+    <PackageReference Include="Serilog" Version="3.*" />
+    <PackageReference Include="Serilog.Sinks.Console" Version="4.*" />
+    <PackageReference Include="Serilog.Sinks.File" Version="5.*" />
+    <PackageReference Include="CsvHelper" Version="33.*" />
   </ItemGroup>
 </Project>

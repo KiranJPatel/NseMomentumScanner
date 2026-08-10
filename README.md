@@ -1,4 +1,81 @@
-# NSE Momentum Stock Scanner — Production v3.1
+# NSE Momentum Stock Scanner — Production v4.1
+
+## What's new in v4.1 (sector rotation, fundamental screen, earnings blackout, weight optimizer)
+
+Closes out the remaining Tier-2 items from the v4.0 architecture review. All four are
+designed to degrade safely: missing data never blocks a BUY, and every new gate defaults
+to whatever behavior keeps risk lowest.
+
+| Area | v4.0 behavior | v4.1 behavior |
+|------|---------------|---------------|
+| **Sector rotation** | `sector` was a hardcoded `"—"` placeholder on the dashboard | 532-symbol best-effort static sector map (`SectorMap`, see its header comment on confidence level) + optional `data/reference.csv` override. Computes a cross-sectional sector-rank percentile each scan (which sectors are actually leading today) — informational by default; `EnableSectorGate` turns it into an actual BUY requirement |
+| **Fundamental screen** | None | CSV-driven (`data/reference.csv`): PE, ROE, debt/equity, EPS growth, promoter pledge. **Off by default** — a symbol with no data always passes, so turning it on with an empty CSV is a safe no-op until populated |
+| **Earnings blackout** | None | Same CSV's `next_earnings_date`. **On by default** (safe default: can only narrow the BUY list, never widen it, and only fires when a date is actually known) — excludes BUY tags within `EarningsBlackoutDays` (default 3) of a known earnings date |
+| **Weight feedback loop** | Backtest engine existed but never fed results back into live scoring weights (`VcpWeight` etc. were hardcoded consts) | `--optimize-weights` runs a random search over the 6 weights, backtesting each with the *same* `BacktestEngine`/`PerformanceAnalyzer` as `--backtest`, and writes the winner to `optimized_weights.json`. The live scanner (and `--serve`/`--backtest`) loads it automatically next run if fresher than `OptimizedWeightsMaxAgeDays` (default 120) |
+
+**Why CSV-driven, not another live API call:** fundamentals and earnings dates would
+normally come from a live data source, but no such endpoint is reachable from the
+environment this was built in, and the scanner already manages Yahoo rate-limit risk
+carefully (`MaxConcurrentFetches`, retry/backoff, disk cache). Doubling that traffic for
+fundamentals that are often missing/unreliable for small/mid caps on Yahoo anyway was a
+bad trade. Point `data/reference.csv` at your own vendor export, a screener.in/Tijori
+download, or maintain it by hand for the names you actually care about — see
+`data/reference.csv` for the exact format. **The built-in sector map is a best-effort
+seed classification, not verified NSE/vendor data** — verify before relying on it for
+capital allocation, and use the CSV override to correct anything wrong.
+
+**Weight optimizer usage:**
+```bash
+NseMomentumScanner --optimize-weights --iterations=30 --objective=sharpe
+```
+Only the first iteration re-fetches historical data (the rest reuse the backtest engine's
+own disk cache), so iteration count costs mostly CPU time, not additional network/rate-limit
+risk. Candidates with too few trades (`--min-trades`, default 15) or too much drawdown
+(`--max-drawdown`, default 35%) are disqualified rather than allowed to win on a fluke. If
+the baseline (current defaults) wins the search, no file is written — the search isn't
+forced to "find" an improvement that isn't there.
+
+**Also added:** full DB schema for all of the above (`sector_rotation` table,
+`aggregated_results` sector/fundamental/earnings columns, `scan_sessions.weight_source`
+audit column), migrated in place via the same idempotent `MigrateSchema()` as v4.0, plus
+dashboard updates (Sector Bias panel now shows real data, `EARN` badge, Sector &
+Fundamentals section in the stock detail modal, "Weights: optimized/default" indicator in
+the regime banner).
+
+---
+
+## What's new in v4.0 (Principal Quant review pass)
+
+A strategy-level review identified that the scanner scored every stock in isolation —
+no market context, no relative strength, no coherence check across timeframes, no
+liquidity/overextension floor. v4.0 addresses the five highest-impact gaps:
+
+| Area | v3.x behavior | v4.0 behavior |
+|------|---------------|---------------|
+| **Market regime** | None — BUY tags generated regardless of the broader market | Fetches Nifty 50 once/scan, classifies BULLISH/NEUTRAL/BEARISH off EMA50/EMA200. In BEARISH or weak-breadth markets, the BUY score threshold rises (+15 pts, configurable) and the BUY count shrinks to ~1/3 |
+| **Relative Strength** | None — a stock could rank #1 while lagging the index | IBD-style RS: blends 3/6/9/12-month returns vs Nifty (recent quarter double-weighted) into a 1–99 cross-sectional percentile. BUY requires RS ≥ 70 |
+| **Timeframe coherence** | `BullishTfCount`/`BearishTfCount` computed but unused — a single strong TF could drag the composite score over the line | BUY requires ≥4/6 bullish timeframes **and** a non-negative weekly score; SELL requires the bearish mirror |
+| **Liquidity** | No floor — thin/penny names could be tagged BUY | BUY requires ≥₹5cr/day avg turnover and ≥₹20 price (both configurable) |
+| **Overextension** | No check — a stock 40% above its 50-EMA scored the same as one at a sane entry | BUY requires ≤25% extension above the 50-EMA (configurable); flagged `EXTENDED` on the dashboard otherwise |
+
+All five gates are configurable in `appsettings.json` under the `v4.0` block (benchmark
+symbol, RS/breadth/liquidity/extension thresholds, ATR stop parameters). None of this
+changes the underlying six-signal scoring model (Supertrend/HMA/ADX/VCP/Volume/Trend) —
+it changes *which* high-scoring stocks actually get tagged BUY, and adds a `GateReason`
+so a stock that scored like a BUY but got blocked shows *why* on the dashboard's new
+"Near-Miss" panel instead of silently disappearing.
+
+**Also added:**
+- ATR-based suggested stop-loss/target on every live BUY signal (surfaced in the dashboard
+  table and stock detail modal), using the same ATR-multiple approach the backtest engine's
+  `PositionSizer`/`ExitEvaluator` already use historically.
+- Data-quality tracking: tickers skipped (thin history, stale data, fetch errors) are now
+  persisted and summarized on the dashboard instead of only appearing in Debug logs.
+- Dashboard: market-regime banner, RS Rank column, Illiquid/Extended badges, suggested
+  stop/target column, a "Near-Miss" panel, and a Data Quality panel.
+- Removed ~90 lines of dead, commented-out duplicate `Config` class.
+
+---
 
 ## Contents
 
@@ -43,33 +120,13 @@ dotnet run -- --serve --port=8080     # custom port
 dotnet run -- --serve --host=0.0.0.0  # allow access from other devices on your LAN
 ```
 
-**Important: open the URL it prints (e.g. `http://localhost:5080`) in your browser — do not
-just double-click `nse_dashboard.html` on disk.** Opening the file directly uses the `file://`
-protocol, which browsers block from fetching local data for security reasons, so it can only
-ever show demo data no matter how many scans you've run. If you do this, the dashboard now
-shows a banner explaining exactly that, instead of silently sitting on demo data.
-
 This starts a small local web server that:
-- Serves `nse_dashboard.html` at `/` (read fresh from disk on every request, so you can edit
-  it without restarting the server)
+- Serves `nse_dashboard.html` at `/`
 - Serves `/dashboard_data.json` **built fresh from the SQLite DB on every request** — no
   export step, no stale snapshot. It's safe to run `--serve` at the same time as a scan is
   in progress (SQLite WAL mode allows concurrent reads while the scanner writes).
-- Serves `/api/health` — a quick JSON status check (resolved DB path, whether it exists, and
-  how many scan sessions are in it) if you want to confirm the server is looking at the right
-  database.
-- Prints the resolved DB path and session count to the console at startup, so a wrong working
-  directory or an empty database is obvious immediately rather than something you have to
-  guess at from the browser.
 - The dashboard auto-refreshes every 30 seconds and shows a live "updated HH:MM:SS" indicator
-  in the header. If it can't load live data — server not running, DB not found yet, no scans
-  in it — it now shows a banner explaining specifically why, instead of quietly staying on
-  demo data with no explanation.
-
-Note: `--serve` only serves the dashboard page and the two JSON endpoints above — it does not
-expose the rest of the working directory (earlier builds served the whole folder as static
-files, which both risked a stale `dashboard_data.json` silently shadowing the live endpoint and
-needlessly exposed the raw SQLite DB / `appsettings.json` over HTTP; this is now fixed).
+  in the header so you always know how fresh what you're looking at is.
 
 You generally don't need `export_dashboard_data.py` or a static `dashboard_data.json` anymore —
 that script is kept only as an optional way to produce a one-off, fully offline snapshot
@@ -215,23 +272,254 @@ range meters, supertrend analysis, and links to NSE + Yahoo charts.
   day, and the new monthly timeframe adds ~20% more Yahoo requests overall — this keeps
   same-day re-runs fast without extra API load. Daily/intraday are always fetched live.
 
-## Production Readiness Changes (v3.3)
+## Known Limitations / Suggested Next Steps
 
-- **Fixed the dashboard silently showing demo data with no explanation.** Two causes, both
-  fixed:
-  1. `--serve` previously served the *entire working directory* as static files (via
-     `UseStaticFiles`). That could silently shadow the live `/dashboard_data.json` endpoint
-     with a stale static file of the same name (e.g. left over from the legacy Python export
-     script) — the exact bug that makes "live" data look permanently stuck. It also exposed
-     the raw SQLite DB and `appsettings.json` over unauthenticated HTTP. Replaced with three
-     explicit, safe routes (`/`, `/dashboard_data.json`, `/api/health`) and nothing else.
-  2. Opening `nse_dashboard.html` directly (`file://`) rather than via the printed
-     `http://localhost:5080` URL can only ever show demo data — browsers block `file://`
-     pages from fetching local data. The dashboard now detects this and shows a banner
-     explaining it, instead of failing silently.
-- `--serve` now prints the resolved DB path, whether it exists, and the scan-session count at
-  startup, so a wrong working directory or an empty database is obvious in the console
-  immediately. A new `/api/health` endpoint exposes the same info on demand.
-- When live data fails to load for any other reason (server unreachable, no scans in the DB
-  yet, etc.), the dashboard now shows the *actual* reason in a banner and in the browser
-  console, instead of quietly falling back to demo data with no indication why.
+- **This environment has no .NET SDK**, so `Program.cs` could not be compiled here. Every
+  edit was reviewed by hand (brace/paren balance verified programmatically across the whole
+  file, including after the v4.1 additions), but please run `dotnet restore && dotnet build`
+  locally before trusting this in production. The dashboard's JavaScript *was* verified —
+  `node --check` confirms valid syntax, and a jsdom smoke test exercised every tab, the
+  regime banner (including the v4.1 weight-source indicator), the Sector & Fundamentals
+  modal section, the EARN/EXT/ILLIQ badges, sorting, search, and the stock detail modal
+  end-to-end with zero runtime errors — including the "no fundamentals data" fallback path.
+- `WeightOptimizer.cs` (the `--optimize-weights` search) is new code that reuses the
+  existing `BacktestEngine`/`PerformanceAnalyzer` rather than reimplementing simulation
+  logic, which limits its own surface area for bugs, but it hasn't been run end-to-end here
+  either — the same "verify with a real build" caveat applies, doubly so before trusting a
+  weight file it produces in production. Start with a small `--iterations` count to sanity-check
+  timing before a full run.
+- **`SectorMap`'s 532-symbol classification is a best-effort seed built from general
+  knowledge, not verified NSE/vendor sector data.** Cross-check anything you plan to act on,
+  and use `data/reference.csv`'s `sector` column to correct entries — that always takes
+  priority over the built-in map. `EnableSectorGate` defaults to `false` for this reason;
+  the sector-rotation panel is informational until you're confident in the classification.
+- `data/reference.csv` ships with a single placeholder row (`EXAMPLE.NS`) showing the exact
+  column format — it does **not** contain real fundamental data for any actual company. The
+  fundamental screen and earnings blackout do nothing until you populate this yourself from
+  a data source you trust (see the v4.1 section above for why this is CSV-driven rather than
+  another live API call).
+- Run `dotnet ef` isn't used here — the new tables (`market_regime`, `data_quality_issues`,
+  `sector_rotation`) and the new columns on `scan_results`/`aggregated_results`/`scan_sessions`
+  are created via `MigrateSchema()` (idempotent `ALTER TABLE`, safe to run against an existing
+  v3.x or v4.0 `NseMomentumScanner.db`).
+- The daily-bar timestamp handling (`isIntraday` bars are shifted +5:30 to IST; daily bars are
+  left as returned by Yahoo) wasn't changed in this pass — it's worth spot-checking a few
+  symbols' daily bar dates against the NSE bhavcopy if exact trading-day alignment matters to you.
+- For further modularization (e.g. splitting into the layered Domain/Infrastructure/API project
+  structure you've used on other projects), this single-file `Program.cs` can be split along its
+  existing region boundaries (Config, Models, Fetcher, Analytics, Database, Dashboard, Reporting)
+  without changing behavior — happy to do that as a follow-up if you'd like it as separate projects.
+
+## Backtesting Engine (new)
+
+A full backtesting engine has been added under `Backtesting/` (21 new files, ~3,300 lines) —
+**no existing scanner code was rewritten**; the only edits to `Program.cs` are a `using` line,
+a new `--backtest` / `--mode=backtest` CLI branch, and two new dashboard routes. Everything else
+is new, additive files.
+
+### What it does
+Runs the scanner's *own* signal-generation code (`TickerScorer` + `MultiTfAggregator` — completely
+unmodified, called directly) over a historical date range instead of "today", then simulates trades
+day by day: position sizing, stop-loss/target/trailing-stop/time/Supertrend/HMA exits, brokerage/STT/
+GST/stamp-duty/SEBI charges/slippage, a portfolio ledger with max-positions/exposure limits, and a
+full trade journal + equity curve + all the metrics from your spec (Sharpe, Sortino, Calmar, MAR,
+Ulcer Index, expectancy, drawdown, profit factor, consecutive win/loss streaks, etc.).
+
+### Running it
+```bash
+dotnet run -- --backtest          # or: dotnet run -- --mode=backtest
+```
+Configure it entirely via the new `"Backtest"` section in `appsettings.json` (already populated
+with working defaults — see the file). Reports land in `backtest_reports/run_<dates>_<timestamp>/`
+as `report.html` (self-contained, Chart.js equity/drawdown charts + monthly heat map + full trade
+table), `trades.csv`, `equity_curve.csv`, and `report.json`. Every run is also written to six new
+SQLite tables in the *same* `NseMomentumScanner.db` (`BacktestRuns`, `BacktestTrades`,
+`PortfolioSnapshots`, `EquityCurve`, `PerformanceSummary`, `Parameters`) — the scanner's own tables
+are never touched. A new dashboard page at `--serve` → `http://localhost:5080/backtest` lists past
+runs and lets you drill into any of them; `nse_dashboard.html` itself was not modified.
+
+### Production-hardening pass
+After the first working version, this was reviewed a second time specifically for production
+readiness and performance, which turned up and fixed several real issues rather than just cosmetic
+ones:
+- **Thread-safety fix**: the per-symbol indicator cache (`DailySeriesIndex`) was a plain
+  `Dictionary` being written to concurrently from `Parallel.ForEachAsync` across tickers — switched
+  to `ConcurrentDictionary`. Under the default concurrency settings this could have caused data
+  corruption or an intermittent crash.
+- **Crash isolation**: indicator computation (Supertrend/HMA/ATR) for one ticker wasn't wrapped in
+  a try/catch inside the parallel fetch loop — a single pathological ticker's data shape could have
+  taken down the entire run. It's now isolated and logged per-ticker like every other fetch step.
+- **Dedicated backtest-only Yahoo-history cache** (`BacktestDataCache.cs`): the scanner's *existing*
+  cache deliberately excludes daily/intraday bars, which is correct for live scanning but meant
+  every backtest re-run was re-downloading years of history from Yahoo from scratch — even for
+  back-to-back runs while tuning a stop-loss %. This was a real gap against the original spec's
+  "reuse cached data" requirement. The new cache is entirely separate from, and never touches, the
+  scanner's own `.cache/yahoo/` directory or its cache semantics; configurable via
+  `Backtest.CacheEnabled` / `Backtest.CacheHours` (default 12h).
+- **Removed duplicate indicator computation**: per-ticker Supertrend/HMA/ATR were being computed via
+  the scanner's "compute everything" `IndicatorArrays.Compute()` (which also computes ADX, EMA
+  fast/slow, and a volume SMA the backtest never reads) — and then, when `"1d"` is also a scoring
+  timeframe (the default), computed *again* inside `TickerScorer.Score`. `SymbolDailySeries` now
+  computes only the three arrays the exit rules actually use, directly.
+- **Bulk-insert optimization**: SQLite writes for trades/snapshots/equity curve (which can run into
+  the thousands of rows for a multi-year run) now reuse one prepared command with bound parameters
+  per table instead of allocating a fresh command object per row.
+- **Matched the scanner's own production SQLite tuning** (WAL, `synchronous=NORMAL`, cache size,
+  mmap) in the new backtest repository, plus a best-effort post-commit WAL checkpoint.
+- **Fail-fast config validation**: nonsensical settings (zero/negative capital, zero max positions,
+  inverted dates, an empty custom universe) are now caught up front with a clear message instead of
+  silently producing an empty or crashing backtest deep inside the engine.
+- Minor: removed a wasteful empty-list allocation happening on every single simulated trading day,
+  removed dead code left over from an earlier draft, and added fetch-progress logging so a long,
+  rate-limited data-fetch phase isn't silent.
+
+### Decision-reliability pass (new)
+A second follow-up focused specifically on whether the *numbers themselves* can be trusted for a
+real decision, not just whether the code runs cleanly:
+- **Verified no look-ahead bias in the scanner's own scoring machinery.** Traced `VcpDetector`,
+  `PriceLevelCalculator`, and `SupertrendMetricsCalculator` — all three index strictly backward
+  from the scoring date at the array level (confirmed by reading the actual loop bounds, e.g.
+  `VcpDetector.Detect(quotes, i - VcpLookbackDays + 1, i)` never passes an end index past `i`). This
+  was worth checking explicitly: it's the kind of bug that's invisible in live scanning (there is no
+  future data yet) but would silently inflate a backtest if it existed. It doesn't.
+- **Added computed reliability caveats per run** (`BacktestDiagnostics.cs`), surfaced prominently —
+  first thing in the HTML report, a dedicated warning panel in the dashboard, and printed to the
+  console — rather than buried in this README where they're easy to skip:
+  - **Survivorship bias**: `Nifty200`/`SMID`/`NewListings`/`All` are *today's* constituent lists,
+    applied retroactively. A stock that got delisted or dropped from the index mid-backtest is
+    silently absent; one that only qualified recently is included for the whole period. This is a
+    textbook way backtests overstate real returns, and it's now called out by name on every run
+    that uses one of these universes (a `Custom` ticker list you supply yourself doesn't trigger it).
+  - **Small sample size**: fewer than 30 completed trades triggers a note that Sharpe/Sortino/win
+    rate/profit factor aren't statistically meaningful yet — easy to overlook when a `report.html`
+    shows a shiny Sharpe ratio computed from four trades.
+  - **Data coverage**: flags when meaningfully fewer tickers had usable data than were requested.
+  - **Intraday-history-limit reminder**: dynamic version of the caveat below, computed from the
+    actual configured timeframes and date range for that specific run.
+  - **A standing overfitting reminder**: re-tuning parameters against the same historical window and
+    keeping the best result is a known way to fool yourself; every report says so.
+  These are persisted to the database (as JSON under a `Caveats` parameter) and reconstructed by the
+  dashboard, so a caveat travels with the report even months later — it's never just console output
+  that scrolled away.
+
+### US market support (new)
+
+Three new `Backtest.Universe` options: `"Nasdaq100"` (103 tickers, cross-checked against live
+holdings data rather than pulled from memory), `"DowJones"` (all 30), and `"USMarket"` (the
+deduplicated union — there's real overlap, e.g. MSFT/AAPL/AMZN/GOOGL/NVDA/HON/AMGN/CSCO/WMT sit in
+both). Tickers live in `Backtesting/UsMarketUniverses.cs` and use plain Yahoo symbols with no
+suffix (correct for Nasdaq/NYSE-listed stock, including foreign ADSs like ASML/NXPI/ARM/MELI/PDD
+that list directly on a US exchange).
+
+This isn't just three new lists bolted onto the existing engine — selecting one of them changes
+three things under the hood, all derived from a single `BacktestMarket.RegionFor(Universe)` check:
+- **Trading calendar**: a proper NYSE/Nasdaq holiday calendar (`UsMarketCalendar.cs`), not the NSE
+  one. All 10 real market holidays, including the moveable ones (Good Friday via an Easter-Sunday
+  calculation, MLK/Presidents/Memorial/Labor Day/Thanksgiving via weekday-of-month rules), with the
+  standard Saturday→Friday / Sunday→Monday observation shift for fixed-date holidays. Verified
+  against known reference dates before trusting it, not just eyeballed.
+- **Cost model**: US backtests are no longer charged Indian STT/GST/stamp duty/SEBI charges, which
+  obviously don't apply to US equities. Instead: a configurable flat commission (`UsCommissionPerOrder`,
+  defaults to $0 to reflect a typical modern zero-commission broker) plus the two small regulatory
+  pass-through fees every US broker charges regardless (`UsSecFeeSellPct`, `UsFinraTafPerShare` /
+  `UsFinraTafCapPerOrder`) — see `Backtesting/CostCalculator.cs`.
+- **Currency display**: `$` instead of `₹` in the HTML report, dashboard, and JSON; the console
+  keeps ASCII `Rs.`/`$` prefixes rather than a Unicode symbol, matching the existing console output's
+  original ASCII-only design rather than introducing a Unicode character that wasn't there before.
+
+**One thing this does NOT do**: `InitialCapital` is still a single config field interpreted in
+whichever currency matches the selected universe — set it to a sensible USD figure (e.g. `100000`)
+when backtesting a US universe, since the default (`1000000`) was chosen with ₹10 lakh in mind. A
+caveat about this is added automatically to every US-universe run's report.
+
+**Running a US backtest**: the default `appsettings.json` still runs `Nifty200` unchanged (the
+live scanner and default backtest behavior stay India-focused) — to backtest Nasdaq-100 instead,
+override the relevant keys before running `dotnet run -- --backtest`:
+```json
+"Backtest": {
+  "Universe": "Nasdaq100",
+  "InitialCapital": 100000,
+  "UseFixedPercentStop": false
+}
+```
+`UsCommissionPerOrder` / `UsSecFeeSellPct` / `UsFinraTafPerShare` / `UsFinraTafCapPerOrder` are
+already populated in `appsettings.json` with sensible defaults, so no extra config is required to
+get a working US-market cost simulation — only `Universe` and `InitialCapital` typically need
+changing.
+
+`Custom` ticker lists still default to the India cost model/calendar (most Custom lists on this
+project will be NSE tickers) — `BacktestMarket.RegionFor` is the one place to extend if you build a
+Custom list of US tickers and want it treated as a US backtest.
+
+### Important caveats — please read before trusting the numbers
+- **Not compiled here.** No NuGet/SDK access in this environment, in either pass. Every file was
+  reviewed by hand against the actual class signatures in your codebase, and checked for balanced
+  braces/parens, but please run `dotnet restore && dotnet build` locally; if the compiler flags
+  anything, it's almost certainly a small naming/signature mismatch and quick to fix.
+- **Yahoo's intraday history is short.** 5m/15m/30m bars are only available for roughly the last
+  ~60 days, 1h for ~2 years, regardless of the backtest's `StartDate`. For a multi-year backtest,
+  the default config (`"Timeframes": ["1d"]`) is the realistic choice — intraday timeframes will
+  silently contribute nothing before their own history window starts (the aggregator already
+  degrades gracefully when a timeframe has no data for a given date), so adding them mainly helps
+  the *most recent* stretch of a long backtest.
+- **Look-ahead-bias policy** (documented in code comments in `BacktestEngine.cs`/`ExitEvaluator.cs`):
+
+  stop-loss/target are checked intrabar using each day's own High/Low; every other decision (new
+  entries, Supertrend/HMA/time/signal exits) is decided from a day's close but only ever *executed*
+  at the next trading day's open. This is a standard, defensible convention, but it is a modeling
+  choice, not a law of nature — worth knowing before comparing results to a different backtester.
+- **Brokerage/STT/GST/stamp-duty/SEBI rates are configurable estimates**, not certified figures.
+  Double-check current rates with your broker before drawing real conclusions from the P&L.
+- This is a simulation tool for evaluating a strategy's historical behavior. It is not investment
+  advice, and past performance in a backtest does not guarantee future results.
+
+## Weight Optimizer (new in v4.1)
+
+Closes the loop between the backtest engine and the live scoring weights. Runs a random
+search over the 6 scoring weights (VCP/Volume/Trend/Supertrend/HMA/ADX), backtests each
+candidate with the *same* `BacktestEngine`/`PerformanceAnalyzer` as `--backtest` (identical
+trade simulation, costs, look-ahead-bias discipline), and writes the best-performing set to
+`optimized_weights.json`.
+
+```bash
+NseMomentumScanner --optimize-weights                          # 30 iterations, Sharpe objective
+NseMomentumScanner --optimize-weights --iterations=50 --objective=calmar --seed=42
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--iterations=N` | 30 | Candidates tried, plus 1 baseline (current defaults) run for comparison |
+| `--objective=X` | sharpe | `sharpe` \| `cagr` \| `calmar` — which metric ranks candidates |
+| `--max-drawdown=N` | 35 | Disqualify any candidate with worse than N% max drawdown |
+| `--min-trades=N` | 15 | Disqualify candidates with too few trades to trust the score |
+| `--seed=N` | random | Fix for a reproducible search |
+| `--output=PATH` | `optimized_weights.json` | Where the winner is written |
+
+Uses the same `"Backtest"` appsettings.json section (universe, date range, costs) as
+`--backtest`. Only the **first** iteration pays for a full historical data fetch — every
+subsequent candidate reuses `BacktestDataCache`'s already-downloaded daily bars, so
+iteration count mostly costs CPU/wall-clock time for the trade simulation, not additional
+Yahoo requests or rate-limit risk.
+
+If the baseline weights win the search, no file is written — a run is not forced to
+"discover" an improvement that isn't there over that period/iteration budget.
+
+**The live scanner picks up a winning weight file automatically** on its next run
+(`Config.TryLoadOptimizedWeightsFromDisk()`, called once at startup for scan/`--serve`/
+`--backtest` alike) — no restart-with-a-flag needed, controlled by `UseOptimizedWeights` in
+`appsettings.json` (default `true`). A weight file older than `OptimizedWeightsMaxAgeDays`
+(default 120) is logged as stale and ignored, since weights tuned against a year-old market
+regime aren't necessarily still appropriate — re-run `--optimize-weights` periodically. The
+dashboard's regime banner shows which weight-set produced the current session
+("Weights: default" or "Weights: optimized 2026-08-01 (sharpe)"), and `scan_sessions.weight_source`
+in the DB is the permanent audit trail.
+
+**This is a random search over a 6-dimensional simplex, not a mathematical optimizer** — a
+discontinuous, path-dependent objective (trade simulation with stops/targets/transaction
+costs) has no tractable closed form, so this is the same pragmatic starting point a quant
+would reach for before something heavier (Bayesian optimization, CMA-ES) is justified by
+iteration budget. Treat a winning weight set as a hypothesis worth walk-forward validating
+on out-of-sample data, not a proof.
+
+
+

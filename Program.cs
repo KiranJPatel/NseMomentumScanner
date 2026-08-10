@@ -1,5 +1,5 @@
 // =============================================================================
-//  NSE Momentum Stock Scanner  ·  Multi-Timeframe  ·  Production v3.3  ·  .NET 8
+//  NSE Momentum Stock Scanner  ·  Multi-Timeframe  ·  Production v4.0  ·  .NET 8
 // -----------------------------------------------------------------------------
 //  NuGet (NseMomentumScanner.csproj):
 //    Microsoft.Data.Sqlite       8.*   (SQLite — Microsoft-official)
@@ -92,6 +92,49 @@
 //  🟠 ADD  --serve prints the resolved DB path, existence, and session count at startup;
 //          /api/health exposes the same info on demand.
 // =============================================================================
+//
+//  STRATEGY CHANGES vs v3.3  (v4.0 — Principal Quant architecture review)
+//  ─────────────────────────────────────────────────────────────────────────────
+//  Prior versions scored every stock in isolation: no market context, no relative
+//  strength, no coherence check across the 6 scored timeframes, no liquidity or
+//  overextension floor. A stock could be tagged BUY while lagging the index, while
+//  the weekly/monthly trend disagreed, while illiquid, or while already 40%+ above
+//  its 50-EMA. v4.0 adds five gates on top of the existing 6-signal score — the
+//  underlying Supertrend/HMA/ADX/VCP/Volume/Trend scoring model is unchanged.
+//  🔴 ADD  Market regime filter: fetches the benchmark (Nifty 50 by default) once
+//          per scan, classifies BULLISH/NEUTRAL/BEARISH off EMA50/EMA200. In a
+//          BEARISH or weak-breadth market, the BUY score threshold rises and the
+//          BUY count shrinks — fewer, higher-conviction signals, not the same
+//          volume regardless of what the market itself is doing.
+//  🔴 ADD  Relative Strength (IBD-style): blends 3/6/9/12-month returns vs the
+//          benchmark into a 1-99 cross-sectional percentile. BUY requires RS≥70 —
+//          a stock scoring well on its own indicators but lagging the market no
+//          longer qualifies.
+//  🔴 ADD  Timeframe-alignment gate: BullishTfCount/BearishTfCount were already
+//          computed but never enforced — a single strong intraday TF could drag
+//          the composite score over the BUY line against an otherwise bearish
+//          weekly/monthly trend. BUY now requires ≥4/6 bullish TFs AND a
+//          non-negative weekly score (SELL requires the bearish mirror).
+//  🔴 ADD  Liquidity + overextension gates: BUY now requires a minimum average
+//          daily turnover and price floor (no thin/penny names), and requires
+//          the stock be within a configurable % of its 50-EMA (no chasing an
+//          already-extended move).
+//  🟠 ADD  ATR-based suggested stop-loss/target on every live BUY signal.
+//  🟠 ADD  GateReason surfaced per stock — a name that scored like a BUY but was
+//          blocked by one of the above gates now shows WHY on the dashboard's
+//          new "Near-Miss" panel, instead of silently disappearing.
+//  🟠 ADD  Data-quality tracking: skipped tickers (thin history, stale data,
+//          fetch/scoring errors) are persisted and summarized on the dashboard
+//          instead of only appearing in Debug logs.
+//  🟡 ADD  market_regime + data_quality_issues tables; new columns on
+//          scan_results/aggregated_results, added via idempotent MigrateSchema()
+//          so an existing v3.x database upgrades in place.
+//  🔵 CLN  Removed ~90 lines of dead, commented-out duplicate Config class.
+//  All new thresholds are configurable in appsettings.json (see the "v4.0" block)
+//  and every new gate degrades gracefully — a benchmark-fetch failure or a
+//  Backtesting-engine call that never supplies benchmark data falls back to
+//  NEUTRAL regime / no RS gate rather than corrupting BUY selection.
+// =============================================================================
 
 using CsvHelper;
 using CsvHelper.Configuration;
@@ -100,6 +143,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using NseMomentumScanner.Backtesting;
 using Serilog;
 using Skender.Stock.Indicators;
 using System;
@@ -147,6 +191,44 @@ namespace NseMomentumScanner
         public string? CacheBaseDir          { get; set; }
         public double? SlowTfCacheHours      { get; set; }
 
+        // ── v4.0: Market regime / relative-strength / risk-quality gates ───────
+        public string? MarketBenchmarkSymbol       { get; set; }
+        public double? MinBullishBreadthPctForBuy  { get; set; }
+        public double? MinRsRankForBuy             { get; set; }
+        public int?    MinBullishTfCountForBuy     { get; set; }
+        public int?    MinBearishTfCountForSell    { get; set; }
+        public double? MinAvgTurnoverInr           { get; set; }
+        public double? MinPriceInr                 { get; set; }
+        public double? MaxExtensionAboveEma50Pct   { get; set; }
+        public int?    LiveAtrPeriod               { get; set; }
+        public double? LiveAtrStopMultiplier       { get; set; }
+        public double? LiveRiskRewardRatio         { get; set; }
+        public double? BearRegimeScoreThresholdBonus { get; set; }
+        public int?    BearRegimeBuyCountDivisor   { get; set; }
+
+        // ── v4.1: configurable scoring weights + backtest-optimized weight feedback ────
+        public double? VcpWeight              { get; set; }
+        public double? VolumeWeight            { get; set; }
+        public double? TrendAlignmentWeight    { get; set; }
+        public double? SupertrendWeight        { get; set; }
+        public double? HmaCrossoverWeight      { get; set; }
+        public double? AdxWeight               { get; set; }
+        public bool?   UseOptimizedWeights     { get; set; }
+        public string? OptimizedWeightsPath    { get; set; }
+        public int?    OptimizedWeightsMaxAgeDays { get; set; }
+
+        // ── v4.1: sector rotation / fundamental quality / earnings blackout ────────────
+        public string? ReferenceDataCsvPath          { get; set; }
+        public bool?   EnableSectorGate              { get; set; }
+        public double? MinSectorRankPercentileForBuy { get; set; }
+        public bool?   EnableFundamentalScreen       { get; set; }
+        public double? MinRoePctForBuy                { get; set; }
+        public double? MaxDebtToEquityForBuy          { get; set; }
+        public double? MinEpsGrowthPctForBuy          { get; set; }
+        public double? MaxPromoterPledgePctForBuy     { get; set; }
+        public bool?   EnableEarningsBlackout        { get; set; }
+        public int?    EarningsBlackoutDays          { get; set; }
+
         private const string FileName = "appsettings.json";
 
         public static AppSettings Load()
@@ -170,92 +252,265 @@ namespace NseMomentumScanner
     // =========================================================================
     //  CONFIG — compile-time defaults; all overridable via AppSettings
     // =========================================================================
+
     internal static class Config
     {
         private static AppSettings _s = new();
 
         public static void ApplySettings(AppSettings s) => _s = s;
 
-        // ── Timeframes (fixed — not overridable via JSON) ─────────────────────
-        // NOTE: weekly's lookback used to be 730 days (~104 weekly bars) while requiring
-        // 175 bars to ever produce a score — meaning the weekly timeframe silently scored
-        // ZERO results in every prior scan. Fixed by giving weekly/monthly their own,
-        // correctly-sized minimum-bar thresholds (see MinBarsWeekly/MinBarsMonthly below)
-        // instead of reusing the daily+VCP threshold, and by giving both a long enough
-        // lookback window to actually reach that threshold.
+        // ── Timeframes (Optimized for 1-Day Focus) ────────────────────────────
+        // Shifts primary weight to the Daily timeframe (45%). 
+        // Increased 1D lookback to 500 days to properly warm up the 200 EMA.
+        // Reduced Intraday lookbacks (55 days of 5m data triggers Yahoo Finance rate limits/bans).
         public static readonly (YahooInterval Interval, string Label, double Weight,
                                  int LookbackDays, bool VcpEnabled)[] ScanTimeframes =
         {
-            (YahooInterval.OneMonth,       "1mo",  0.10, 3650, false), // ~10y → up to ~120 monthly bars
-            (YahooInterval.OneWeek,        "1wk",  0.15, 1095, false), // ~3y  → up to ~156 weekly bars
-            (YahooInterval.OneDay,         "1d",   0.30, 365,  true ),
-            (YahooInterval.OneHour,        "1h",   0.20, 60,   false),
-            (YahooInterval.FifteenMinutes, "15m",  0.15, 55,   false),
-            (YahooInterval.FiveMinutes,    "5m",   0.10, 55,   false),
-        };
+        (YahooInterval.OneMonth,       "1mo",  0.10, 3650, false), // ~120 monthly bars
+        (YahooInterval.OneWeek,        "1wk",  0.15, 1095, false), // ~156 weekly bars
+        (YahooInterval.OneDay,         "1d",   0.45, 500,  true ), // Heavily weighted. 500 days = ~345 bars
+        (YahooInterval.OneHour,        "1h",   0.15, 60,   false),
+        (YahooInterval.FifteenMinutes, "15m",  0.10, 20,   false), // Reduced to prevent API timeouts
+        (YahooInterval.FiveMinutes,    "5m",   0.05, 10,   false), // Reduced to prevent API timeouts
+    };
 
-        public static int    ScanHistoryDays       => _s.ScanHistoryDays      ?? 30;
-        public static int    MaxConcurrentFetches  => _s.MaxConcurrentFetches ?? 2;
-        public static int    FetchTimeoutSeconds   => _s.FetchTimeoutSeconds  ?? 30;
-        public static int    MaxRetries            => _s.MaxRetries           ?? 3;
-        public static int    RetryBaseDelayMs      => _s.RetryBaseDelayMs     ?? 800;
-        public static int    KeepSessionCount      => _s.KeepSessionCount     ?? 10;
-        public static string DbPath                => _s.DbPath               ?? "NseMomentumScanner.db";
-        public static string CsvBaseDir            => _s.CsvBaseDir           ?? "data";
-        public static bool   SkipWeekends          => _s.SkipWeekends         ?? true;
-        public static bool   SkipHolidays          => _s.SkipHolidays         ?? true;
-        public static int    TopBuyCount           => _s.TopBuyCount          ?? 30;
-        public static int    TopSellCount          => _s.TopSellCount         ?? 20;
-        public static int    DashboardPort         => _s.DashboardPort        ?? 5080;
-        public static string DashboardHost         => _s.DashboardHost        ?? "localhost";
-        public static bool   CacheEnabled          => _s.CacheEnabled         ?? true;
-        public static string CacheBaseDir          => _s.CacheBaseDir         ?? Path.Combine(".cache", "yahoo");
-        public static double SlowTfCacheHours       => _s.SlowTfCacheHours    ?? 6.0;
+        // ── System & Network ──────────────────────────────────────────────────
+        public static int ScanHistoryDays => _s.ScanHistoryDays ?? 30;
+        public static int MaxConcurrentFetches => _s.MaxConcurrentFetches ?? 5;   // Increased from 2 for speed
+        public static int FetchTimeoutSeconds => _s.FetchTimeoutSeconds ?? 30;
+        public static int MaxRetries => _s.MaxRetries ?? 3;
+        public static int RetryBaseDelayMs => _s.RetryBaseDelayMs ?? 1500; // Increased to respect rate limits
+        public static int KeepSessionCount => _s.KeepSessionCount ?? 10;
+        public static string DbPath => _s.DbPath ?? "NseMomentumScanner.db";
+        public static string CsvBaseDir => _s.CsvBaseDir ?? "data";
+        public static bool SkipWeekends => _s.SkipWeekends ?? true;
+        public static bool SkipHolidays => _s.SkipHolidays ?? true;
+        public static int TopBuyCount => _s.TopBuyCount ?? 30;
+        public static int TopSellCount => _s.TopSellCount ?? 20;
+        public static int DashboardPort => _s.DashboardPort ?? 5080;
+        public static string DashboardHost => _s.DashboardHost ?? "localhost";
+        public static bool CacheEnabled => _s.CacheEnabled ?? true;
+        public static string CacheBaseDir => _s.CacheBaseDir ?? Path.Combine(".cache", "yahoo");
+        public static double SlowTfCacheHours => _s.SlowTfCacheHours ?? 6.0;
 
-        // ── Indicator periods (compile-time) ──────────────────────────────────
-        public static int    SupertrendPeriod      => _s.SupertrendPeriod     ?? 9;
-        public static double SupertrendMultiplier  => _s.SupertrendMultiplier ?? 1.6;
-        public const  int    FastHmaPeriod         = 9;
-        public const  int    SlowHmaPeriod         = 21;
-        public const  int    AdxPeriod             = 14;
-        public const  int    VolumeSmaPeriod       = 20;
-        public const  int    EmaFastPeriod         = 9;
-        public const  int    EmaSlowPeriod         = 63;
+        // ── v4.0: Market regime / relative strength / risk-quality gates ───────
+        // Yahoo symbol for the benchmark index used for regime + relative-strength.
+        // "^NSEI" = Nifty 50. Fetched once per scan, not once per ticker.
+        public static string MarketBenchmarkSymbol => _s.MarketBenchmarkSymbol ?? "^NSEI";
+        public const int MarketRegimeEmaFastPeriod = 50;
+        public const int MarketRegimeEmaSlowPeriod = 200;
+        // Lookback (calendar days) for the benchmark fetch — mirrors the daily stock lookback
+        // so RS calculations always have a matching date range.
+        public const int MarketRegimeLookbackDays = 500;
+
+        // Breadth: % of universe scoring bullish (TotalScore>0) on the daily TF. Below this,
+        // the market is not confirming individual buy signals — treat BUY generation with extra care.
+        public static double MinBullishBreadthPctForBuy => _s.MinBullishBreadthPctForBuy ?? 40.0;
+
+        // Relative Strength percentile rank (1-99, IBD-style) required for a BUY tag. A stock
+        // scoring well on its own indicators but lagging the benchmark/peer group is excluded.
+        public static double MinRsRankForBuy => _s.MinRsRankForBuy ?? 70.0;
+
+        // Timeframe-alignment coherence gate: a BUY needs at least this many of the 6 scored
+        // timeframes bullish (not just a composite score that one strong TF can drag over the line).
+        public static int MinBullishTfCountForBuy => _s.MinBullishTfCountForBuy ?? 4;
+        public static int MinBearishTfCountForSell => _s.MinBearishTfCountForSell ?? 4;
+
+        // Liquidity gate: average daily turnover (20-day avg volume * last close, in INR) and a
+        // minimum price floor, to keep thin/penny names out of the BUY list.
+        public static double MinAvgTurnoverInr => _s.MinAvgTurnoverInr ?? 50_000_000.0; // ₹5 crore/day
+        public static double MinPriceInr => _s.MinPriceInr ?? 20.0;
+
+        // Overextension gate: % above the 50-EMA. Past this, a stock is no longer a sane fresh
+        // entry even if every other indicator agrees — it's chased, not bought.
+        public static double MaxExtensionAboveEma50Pct => _s.MaxExtensionAboveEma50Pct ?? 25.0;
+
+        // ATR-based suggested stop/target surfaced on live BUY candidates (not a backtest —
+        // just a risk reference point computed the same way ExitEvaluator does historically).
+        public static int LiveAtrPeriod => _s.LiveAtrPeriod ?? 14;
+        public static double LiveAtrStopMultiplier => _s.LiveAtrStopMultiplier ?? 2.5;
+        public static double LiveRiskRewardRatio => _s.LiveRiskRewardRatio ?? 2.5;
+
+        // When the market regime is BEARISH, don't just keep issuing the same volume of BUY tags —
+        // raise the bar (extra points needed) and shrink how many can be tagged at all.
+        public static double BearRegimeScoreThresholdBonus => _s.BearRegimeScoreThresholdBonus ?? 15.0;
+        public static int BearRegimeBuyCountDivisor => _s.BearRegimeBuyCountDivisor ?? 3;
+
+        // IBD-style relative strength: blend of trailing returns over ~3/6/9/12 months, most
+        // recent quarter weighted double vs the other three (standard IBD RS Rating construction).
+        public static readonly int[]    RsLookbackTradingDays = { 63, 126, 189, 252 };
+        public static readonly double[] RsLookbackWeights     = { 0.40, 0.20, 0.20, 0.20 };
+
+        // ── Indicator periods ─────────────────────────────────────────────────
+        public static int SupertrendPeriod => _s.SupertrendPeriod ?? 10;
+        public static double SupertrendMultiplier => _s.SupertrendMultiplier ?? 3.0; // 2.5 causes whipsaws on 1D charts; 3.0 is standard
+        public const int FastHmaPeriod = 21;
+        public const int SlowHmaPeriod = 55;
+        public const int AdxPeriod = 14;
+        public const int VolumeSmaPeriod = 20;
+        public const int EmaFastPeriod = 50;  // Standard for VCP/Momentum (Minervini)
+        public const int EmaSlowPeriod = 200;
 
         // ── VCP parameters ────────────────────────────────────────────────────
-        public const int    VcpLookbackDays       = 100;
-        public const int    VcpSwingSensitivity   = 3;
-        public const int    VcpMinSwings          = 2;
-        public const double VcpVolatilityRatio    = 0.80;
-        public const double VcpVolumeDropRatio    = 0.70;
+        public const int VcpLookbackDays = 100;
+        public const int VcpSwingSensitivity = 4;    // Slightly higher to ignore market noise
+        public const int VcpMinSwings = 2;    // Allow minimum of 2 contractions (T1, T2)
+        public const double VcpVolatilityRatio = 0.85;
+        public const double VcpVolumeDropRatio = 0.65; // Stricter volume dry-up constraint
 
-        // ── Scoring weights ───────────────────────────────────────────────────
-        public const int    SupertrendWeight      = 30;
-        public const int    HmaCrossoverWeight    = 15;
-        public const int    AdxWeight             = 15;
-        public const int    VcpWeight             = 15;
-        public const int    VolumeWeight          = 15;
-        public const int    TrendAlignmentWeight  = 10;
+        // ── Scoring weights (Total = 100) ─────────────────────────────────────
+        // v4.1: these were compile-time consts — now overridable via appsettings.json AND,
+        // if present, by an optimized_weights.json produced by `--optimize-weights` (the
+        // backtest-driven weight search). Precedence: optimized file > appsettings.json >
+        // hardcoded default. ApplyOptimizedWeights(null) reverts to the appsettings/default
+        // layer — used by the weight optimizer itself between search iterations so each
+        // candidate is evaluated cleanly and the live process is never left in a
+        // half-applied state if the search is interrupted.
+        private static OptimizedWeights? _optimizedWeights;
+        public static void ApplyOptimizedWeights(OptimizedWeights? w) => _optimizedWeights = w;
+        public static OptimizedWeights? ActiveOptimizedWeights => _optimizedWeights;
+
+        /// <summary>Looks for OptimizedWeightsPath on disk and, if present, fresh enough, and
+        /// UseOptimizedWeights is true, applies it. Called once at process startup for every
+        /// mode (scan/serve/backtest) so the live weights, the dashboard, and an ad-hoc
+        /// `--backtest` run all agree on which weight-set is actually in effect. Never throws —
+        /// any failure (missing file, malformed JSON, stale) just means "use appsettings/default
+        /// weights instead", logged but not fatal.</summary>
+        public static bool TryLoadOptimizedWeightsFromDisk()
+        {
+            if (!UseOptimizedWeights) return false;
+            string path = OptimizedWeightsPath;
+            if (!File.Exists(path)) return false;
+
+            try
+            {
+                string json = File.ReadAllText(path);
+                var w = JsonSerializer.Deserialize<OptimizedWeights>(json,
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                if (w == null) return false;
+
+                double ageDays = (DateTime.UtcNow - w.GeneratedAtUtc).TotalDays;
+                if (ageDays > OptimizedWeightsMaxAgeDays)
+                {
+                    Log.Warning("Optimized weights at {Path} are {Age:F0} days old (max {Max}) — " +
+                        "ignoring, using default/appsettings weights. Re-run --optimize-weights to refresh.",
+                        path, ageDays, OptimizedWeightsMaxAgeDays);
+                    return false;
+                }
+
+                ApplyOptimizedWeights(w);
+                Log.Information(
+                    "Using backtest-optimized weights from {Path} (generated {Gen:yyyy-MM-dd}, " +
+                    "objective={Obj}, Sharpe={Sharpe:F2}, CAGR={Cagr:F1}%, MaxDD={Dd:F1}%): " +
+                    "VCP={Vcp:F1} Vol={Volw:F1} Trend={Trend:F1} ST={St:F1} HMA={Hma:F1} ADX={Adx:F1}",
+                    path, w.GeneratedAtUtc, w.Objective, w.SharpeRatio, w.CagrPct, w.MaxDrawdownPct,
+                    w.VcpWeight, w.VolumeWeight, w.TrendAlignmentWeight,
+                    w.SupertrendWeight, w.HmaCrossoverWeight, w.AdxWeight);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log.Warning("Could not load optimized weights from {Path}: {Msg} — " +
+                    "using default/appsettings weights.", path, ex.Message);
+                return false;
+            }
+        }
+
+        public static double VcpWeight             => _optimizedWeights?.VcpWeight             ?? _s.VcpWeight             ?? 25.0;
+        public static double VolumeWeight           => _optimizedWeights?.VolumeWeight           ?? _s.VolumeWeight           ?? 20.0;
+        public static double TrendAlignmentWeight   => _optimizedWeights?.TrendAlignmentWeight   ?? _s.TrendAlignmentWeight   ?? 20.0;
+        public static double SupertrendWeight       => _optimizedWeights?.SupertrendWeight       ?? _s.SupertrendWeight       ?? 15.0;
+        public static double HmaCrossoverWeight     => _optimizedWeights?.HmaCrossoverWeight     ?? _s.HmaCrossoverWeight     ?? 10.0;
+        public static double AdxWeight              => _optimizedWeights?.AdxWeight              ?? _s.AdxWeight              ?? 10.0;
+
+        // Where a completed weight search writes its winning candidate, and where the live
+        // scanner looks for one at startup (see Program.RunAsync).
+        public static bool   UseOptimizedWeights    => _s.UseOptimizedWeights ?? true;
+        public static string OptimizedWeightsPath   => _s.OptimizedWeightsPath ?? "optimized_weights.json";
+        // A weight file older than this is treated as stale and ignored (logged, not applied) —
+        // weights tuned against market conditions from a year ago aren't necessarily still valid.
+        public static int    OptimizedWeightsMaxAgeDays => _s.OptimizedWeightsMaxAgeDays ?? 120;
 
         // ── Thresholds ────────────────────────────────────────────────────────
-        public const double AdxStrongThreshold    = 21.0;
-        public const double VolumeSurgeRatio      = 1.5;
-        public const double VolumeLowRatio        = 0.5;
+        public const double AdxStrongThreshold = 25.0;
+        public const double VolumeSurgeRatio = 2.0;  // True breakouts need at least 200% average volume
+        public const double VolumeLowRatio = 0.5;
 
         // ── Minimum bars for scoring (warmup) ─────────────────────────────────
-        // Daily needs EMA63 + VCP(100 bars) + buffer. Weekly/monthly don't run VCP, so they
-        // only need to clear EMA63 with a reasonable buffer — reusing the daily threshold here
-        // was the root cause of weekly scans silently returning zero rows (175 weekly bars
-        // needs ~3.4 years of history; the old lookback window only fetched ~2 years).
-        public const int MinBarsDaily             = 175; // EMA63 + VCP + buffer
-        public const int MinBarsWeekly            = 80;  // EMA63(63) + buffer, no VCP
-        public const int MinBarsMonthly           = 70;  // EMA63(63) + buffer, no VCP
-        public const int MinBarsIntraday          = 50;
+        // Daily now properly accounts for the 200 EMA. 
+        public const int MinBarsDaily = 220; // EMA200 + buffer
+        public const int MinBarsWeekly = 80;
+        public const int MinBarsMonthly = 70;
+        public const int MinBarsIntraday = 50;
 
         // ── Data-quality gates ────────────────────────────────────────────────
-        public const int    MinQuotesRequired       = 30;
-        public const double MaxAllowedGapPct        = 25.0; // >25% single-bar move = suspect
-        public const double MaxStaleDataDays        = 7.0;  // data older than 7d is stale
+        public const int MinQuotesRequired = 30;
+        public const double MaxAllowedGapPct = 20.0; // Tightened: >20% gap is usually a split/bonus artifact
+        public const double MaxStaleDataDays = 4.0;  // 7 days is too long; 4 days covers a 3-day long weekend
+
+        // ── v4.1: sector rotation / fundamental quality / earnings blackout ────
+        // See ReferenceDataProvider's header comment for the CSV format and why this is
+        // CSV-driven rather than another live Yahoo endpoint call.
+        public static string ReferenceDataCsvPath => _s.ReferenceDataCsvPath ?? Path.Combine(CsvBaseDir, "reference.csv");
+
+        // Sector rotation is informational by default (dashboard + DB) — it does NOT gate BUY
+        // generation unless explicitly enabled, since the built-in sector map is a best-effort
+        // seed, not a verified source (see SectorMap's header comment).
+        public static bool   EnableSectorGate              => _s.EnableSectorGate ?? false;
+        public static double MinSectorRankPercentileForBuy => _s.MinSectorRankPercentileForBuy ?? 40.0;
+
+        // Fundamental screen is OFF by default: with no reference.csv populated, every symbol
+        // has "unknown" fundamentals, and unknown never blocks a BUY — so turning this on with
+        // an empty CSV is always safe, but it also means it does nothing until you populate data.
+        public static bool   EnableFundamentalScreen     => _s.EnableFundamentalScreen ?? false;
+        public static double MinRoePctForBuy              => _s.MinRoePctForBuy ?? 10.0;
+        public static double MaxDebtToEquityForBuy        => _s.MaxDebtToEquityForBuy ?? 2.0;
+        public static double? MinEpsGrowthPctForBuy        => _s.MinEpsGrowthPctForBuy; // null = not enforced by default
+        public static double MaxPromoterPledgePctForBuy   => _s.MaxPromoterPledgePctForBuy ?? 50.0;
+
+        // Earnings blackout is ON by default — unlike the fundamental screen, this one is safe
+        // to default-on because it can only ever narrow (never widen) the BUY list, and it only
+        // fires for symbols where a next_earnings_date is actually known.
+        public static bool EnableEarningsBlackout => _s.EnableEarningsBlackout ?? true;
+        public static int  EarningsBlackoutDays   => _s.EarningsBlackoutDays ?? 3;
+    }
+
+    /// <summary>
+    /// The output of a backtest-driven weight search (Backtesting/WeightOptimizer.cs),
+    /// persisted to optimized_weights.json and optionally consumed by the live scanner at
+    /// startup (Config.UseOptimizedWeights). Kept in the main namespace (not Backtesting)
+    /// since Config — a live-scan type — needs to reference it directly.
+    /// </summary>
+    internal sealed class OptimizedWeights
+    {
+        public double VcpWeight           { get; set; }
+        public double VolumeWeight        { get; set; }
+        public double TrendAlignmentWeight{ get; set; }
+        public double SupertrendWeight    { get; set; }
+        public double HmaCrossoverWeight  { get; set; }
+        public double AdxWeight           { get; set; }
+
+        public DateTime GeneratedAtUtc    { get; set; }
+        public string   Objective         { get; set; } = "sharpe";
+        public int      IterationsRun     { get; set; }
+        public DateTime BacktestStartDate { get; set; }
+        public DateTime BacktestEndDate   { get; set; }
+        public string   Universe          { get; set; } = string.Empty;
+
+        // The metrics that justified picking these weights — so a live process applying this
+        // file can log/display WHY, not just the numbers.
+        public double SharpeRatio    { get; set; }
+        public double CagrPct        { get; set; }
+        public double MaxDrawdownPct { get; set; }
+        public double CalmarRatio    { get; set; }
+        public int    TotalTrades    { get; set; }
+        public double WinRatePct     { get; set; }
+
+        // The default/baseline weights' own metrics from the same search, so the improvement
+        // (or lack of one) is visible rather than just trusting the winning number in isolation.
+        public double BaselineSharpeRatio    { get; set; }
+        public double BaselineCagrPct        { get; set; }
+        public double BaselineMaxDrawdownPct { get; set; }
     }
 
     // =========================================================================
@@ -360,6 +615,20 @@ namespace NseMomentumScanner
         public double  MdiValue         { get; set; }
         public bool    VcpDetected      { get; set; }
 
+        // ── v4.0: relative strength, liquidity, extension, ATR risk levels ─────
+        // Populated only for the "1d" timeframe (the only one with a matching benchmark
+        // series and a stable ATR); zero/false on other timeframes.
+        public double  RsRaw            { get; set; }          // blended vs-benchmark return score
+        public bool    HasRs            { get; set; }          // true only if a benchmark series was actually used
+        public double  RsRank           { get; set; }          // cross-sectional percentile, filled in aggregation
+        public double  AvgTurnoverInr   { get; set; }          // 20d avg volume * last close
+        public bool    IsLiquid         { get; set; }
+        public double  ExtensionPct     { get; set; }          // % above 50-EMA
+        public bool    IsExtended       { get; set; }
+        public double  AtrValue         { get; set; }
+        public double  SuggestedStop    { get; set; }
+        public double  SuggestedTarget  { get; set; }
+
         public PriceLevels       Levels    { get; set; } = new();
         public SupertrendMetrics StMetrics { get; set; } = new();
     }
@@ -378,11 +647,86 @@ namespace NseMomentumScanner
         public int      BullishTfCount      { get; set; }
         public int      BearishTfCount      { get; set; }
         public string   RecommendationType  { get; set; } = "HOLD";
+        public string   GateReason          { get; set; } = string.Empty; // why NOT tagged, when close to threshold
         public int      Rank                { get; set; }
         public decimal  LastClose           { get; set; }
         public string   DataSourceTf        { get; set; } = string.Empty;
+
+        // ── v4.0 additions ──────────────────────────────────────────────────
+        public double  RsRaw            { get; set; }
+        public double  RsRank           { get; set; }
+        public double  AvgTurnoverInr   { get; set; }
+        public bool    IsLiquid         { get; set; }
+        public double  ExtensionPct     { get; set; }
+        public bool    IsExtended       { get; set; }
+        public double  AtrValue         { get; set; }
+        public double  SuggestedStop    { get; set; }
+        public double  SuggestedTarget  { get; set; }
+
+        // ── v4.1 additions ──────────────────────────────────────────────────
+        public string  Sector              { get; set; } = "Unclassified";
+        public double  SectorRankPercentile{ get; set; } = 50;
+        public double? PeRatio             { get; set; }
+        public double? RoePct              { get; set; }
+        public double? DebtToEquity        { get; set; }
+        public double? EpsGrowthPct        { get; set; }
+        public double? PromoterPledgePct   { get; set; }
+        public DateTime? NextEarningsDate  { get; set; }
+        public bool    InEarningsBlackout  { get; set; }
+
         public PriceLevels       Levels     { get; set; } = new();
         public SupertrendMetrics StMetrics  { get; set; } = new();
+    }
+
+    /// <summary>
+    /// One day's market-regime snapshot, computed from the benchmark index (Nifty 50 by
+    /// default) plus the universe's own breadth. Used to gate/scale BUY generation instead of
+    /// scoring every stock in isolation regardless of what the overall market is doing.
+    /// </summary>
+    internal sealed class MarketRegimeInfo
+    {
+        public DateTime ScanDate           { get; set; }
+        public string   BenchmarkSymbol    { get; set; } = string.Empty;
+        public decimal  BenchmarkClose     { get; set; }
+        public double   Ema50              { get; set; }
+        public double   Ema200             { get; set; }
+        /// <summary>"BULLISH" | "NEUTRAL" | "BEARISH" — see MarketRegimeAnalyzer.Classify.</summary>
+        public string   Regime             { get; set; } = "NEUTRAL";
+        public int      BreadthTotal       { get; set; }
+        public int      BreadthBullish     { get; set; }
+        public int      BreadthBearish     { get; set; }
+        public double   BreadthPctBullish  { get; set; }
+    }
+
+    /// <summary>
+    /// One symbol's row from the optional data/reference.csv (v4.1) — sector override plus
+    /// fundamental/earnings data the scanner has no live source for in this environment. All
+    /// fields except Symbol are nullable: a present-but-empty CSV cell means "unknown", not
+    /// "zero", and every gate that reads this treats unknown as neutral/non-blocking.
+    /// </summary>
+    internal sealed class ReferenceRecord
+    {
+        public string    Symbol             { get; set; } = string.Empty;
+        public string?   Sector             { get; set; }
+        public double?   PeRatio            { get; set; }
+        public double?   RoePct             { get; set; }
+        public double?   DebtToEquity       { get; set; }
+        public double?   EpsGrowthPct       { get; set; }
+        public double?   PromoterPledgePct  { get; set; }
+        public DateTime? NextEarningsDate   { get; set; }
+    }
+
+    /// <summary>Per-sector rollup used for the sector-rotation panel: how many stocks in this
+    /// sector were scanned, how many are bullish, and the average composite/RS score — so
+    /// "which sectors are leading right now" is a first-class, visible signal.</summary>
+    internal sealed class SectorRotationRow
+    {
+        public string Sector          { get; set; } = string.Empty;
+        public int    StockCount      { get; set; }
+        public int    BullishCount    { get; set; }
+        public double AvgScore        { get; set; }
+        public double AvgRsRaw        { get; set; }
+        public double RankPercentile  { get; set; } // 1-99, higher = stronger sector right now
     }
 
     /// <summary>Pre-computed indicator arrays indexed to match quotes list.</summary>
@@ -395,6 +739,7 @@ namespace NseMomentumScanner
         public EmaResult[]        EmaFast    { get; init; } = Array.Empty<EmaResult>();
         public EmaResult[]        EmaSlow    { get; init; } = Array.Empty<EmaResult>();
         public double[]           VolumeSma  { get; init; } = Array.Empty<double>();
+        public AtrResult[]        Atr        { get; init; } = Array.Empty<AtrResult>();
 
         public static IndicatorArrays Compute(List<StockQuote> quotes)
         {
@@ -419,6 +764,7 @@ namespace NseMomentumScanner
                 EmaFast    = quotes.GetEma(Config.EmaFastPeriod).ToArray(),
                 EmaSlow    = quotes.GetEma(Config.EmaSlowPeriod).ToArray(),
                 VolumeSma  = volSma,
+                Atr        = quotes.GetAtr(Config.LiveAtrPeriod).ToArray(),
             };
         }
     }
@@ -616,6 +962,352 @@ namespace NseMomentumScanner
             "PINELABS.NS","GROWW.NS","SHADOWFAX.NS","FRACTAL.NS"
         };
     }
+    // =========================================================================
+    //  SECTOR MAP  (v4.1 — best-effort static classification)
+    // -----------------------------------------------------------------------
+    //  No live sector-data API is reachable from this environment, so this is a
+    //  hand-built classification covering the Nifty200/SMID universe plus the
+    //  well-known names in NewListingsUniverse. Recent/obscure IPOs this author
+    //  wasn't confident about are deliberately left unclassified rather than
+    //  guessed — a wrong sector tag is worse than a missing one for a rotation
+    //  signal. ReferenceDataProvider's CSV override (data/reference.csv) takes
+    //  priority over this map, so coverage gaps and any misclassifications can
+    //  be corrected without a code change — treat this as a seed, not a source
+    //  of truth, and verify against NSE's own sector/industry classification
+    //  (or a paid data vendor) before relying on it for capital allocation.
+    // =========================================================================
+    internal static class SectorMap
+    {
+        private static readonly Dictionary<string, string> _builtin = BuildMap();
+
+        public static string? TryGetBuiltin(string symbol) =>
+            _builtin.TryGetValue(symbol, out var s) ? s : null;
+
+        private static Dictionary<string, string> BuildMap()
+        {
+            var map = new Dictionary<string, string>(640, StringComparer.OrdinalIgnoreCase);
+            void Add(string sector, params string[] symbols)
+            {
+                foreach (var sym in symbols) map[sym] = sector;
+            }
+
+            Add("IT Services",
+                "TCS.NS","INFY.NS","WIPRO.NS","HCLTECH.NS","TECHM.NS","LTIM.NS","MPHASIS.NS",
+                "PERSISTENT.NS","COFORGE.NS","OFSS.NS","TATAELXSI.NS","TATATECH.NS","KPITTECH.NS",
+                "LTTS.NS","CYIENT.NS","BSOFT.NS","ZENSARTECH.NS","SONATSOFTW.NS","NEWGEN.NS",
+                "HAPPSTMNDS.NS","INTELLECT.NS","LATENTVIEW.NS","MAPMYINDIA.NS","NETWEB.NS",
+                "FSL.NS","ECLERX.NS","REDINGTON.NS","HEXT.NS","INDGN.NS","FRACTAL.NS");
+
+            Add("Internet & Consumer Tech",
+                "NAUKRI.NS","SWIGGY.NS","ETERNAL.NS","NYKAA.NS","PAYTM.NS","POLICYBZR.NS",
+                "INDIAMART.NS","AFFLE.NS","IXIGO.NS","MOBIKWIK.NS","FIRSTCRY.NS","BLACKBUCK.NS",
+                "DELHIVERY.NS","GROWW.NS","PINELABS.NS","SHADOWFAX.NS","BLUESTONE.NS",
+                "UNIECOM.NS","TRAVELFOOD.NS","TBOTEK.NS");
+
+            Add("Banking — Private",
+                "HDFCBANK.NS","ICICIBANK.NS","KOTAKBANK.NS","AXISBANK.NS","INDUSINDBK.NS",
+                "AUBANK.NS","FEDERALBNK.NS","IDFCFIRSTB.NS","YESBANK.NS","BANDHANBNK.NS",
+                "RBLBANK.NS","CUB.NS","KARURVYSYA.NS","J&KBANK.NS","IDBI.NS","DCBBANK.NS");
+
+            Add("Banking — PSU",
+                "SBIN.NS","BANKBARODA.NS","PNB.NS","CANBK.NS","UNIONBANK.NS","INDIANB.NS",
+                "BANKINDIA.NS","CENTRALBK.NS","MAHABANK.NS","UCOBANK.NS","IOB.NS");
+
+            Add("NBFC & Diversified Financials",
+                "BAJFINANCE.NS","BAJAJFINSV.NS","BAJAJHFL.NS","BAJAJHLDNG.NS","CHOLAFIN.NS",
+                "CHOLAHLDNG.NS","LICHSGFIN.NS","M&MFIN.NS","MUTHOOTFIN.NS","SHRIRAMFIN.NS",
+                "LTF.NS","PFC.NS","RECLTD.NS","HUDCO.NS","IREDA.NS","IRFC.NS","JIOFIN.NS",
+                "SBICARD.NS","MFSL.NS","MOTILALOFS.NS","360ONE.NS","IIFL.NS","POONAWALLA.NS",
+                "MANAPPURAM.NS","CREDITACC.NS","AAVAS.NS","CANFINHOME.NS","PNBHOUSING.NS",
+                "HOMEFIRST.NS","AADHARHFC.NS","APTUS.NS","FIVESTAR.NS","SBFC.NS","CGCL.NS",
+                "SAMMAANCAP.NS","IFCI.NS","JMFINANCIL.NS","ANANDRATHI.NS","ANGELONE.NS",
+                "NUVAMA.NS","CDSL.NS","BSE.NS","MCX.NS","IEX.NS","CAMS.NS","KFINTECH.NS",
+                "CRISIL.NS","UTIAMC.NS","HDFCAMC.NS","NAM-INDIA.NS","ABSLAMC.NS","AWL.NS",
+                "AIIL.NS","CHOICEIN.NS","HDBFS.NS","TATACAP.NS","PIRAMALFIN.NS");
+
+            Add("Insurance",
+                "HDFCLIFE.NS","SBILIFE.NS","ICICIGI.NS","ICICIPRULI.NS","LICI.NS","GICRE.NS",
+                "NIACL.NS","STARHEALTH.NS","GODIGIT.NS","NIVABUPA.NS");
+
+            Add("Automobile — OEM",
+                "MARUTI.NS","TATAMOTORS.NS","M&M.NS","HYUNDAI.NS","BAJAJ-AUTO.NS",
+                "HEROMOTOCO.NS","EICHERMOT.NS","TVSMOTOR.NS","ASHOKLEY.NS","FORCEMOT.NS",
+                "ESCORTS.NS","OLAELEC.NS","ATHERENERG.NS","OLECTRA.NS","MAHSCOOTER.NS");
+
+            Add("Auto Ancillary",
+                "BOSCHLTD.NS","MOTHERSON.NS","BHARATFORG.NS","MRF.NS","BALKRISIND.NS",
+                "APOLLOTYRE.NS","CEATLTD.NS","JKTYRE.NS","EXIDEIND.NS","SONACOMS.NS",
+                "ENDURANCE.NS","SCHAEFFLER.NS","TIINDIA.NS","UNOMINDA.NS","SUNDRMFAST.NS",
+                "MINDACORP.NS","ASAHIINDIA.NS","ZFCVINDIA.NS","MSUMI.NS","JBMA.NS",
+                "CRAFTSMAN.NS","RKFORGE.NS","ARE&M.NS","GNA.NS","BELRISE.NS","KROSS.NS");
+
+            Add("Pharmaceuticals",
+                "SUNPHARMA.NS","DRREDDY.NS","CIPLA.NS","DIVISLAB.NS","LUPIN.NS","AUROPHARMA.NS",
+                "ALKEM.NS","TORNTPHARM.NS","ZYDUSLIFE.NS","MANKIND.NS","GLENMARK.NS",
+                "IPCALAB.NS","AJANTPHARM.NS","ABBOTINDIA.NS","GLAXO.NS","ASTRAZEN.NS",
+                "PFIZER.NS","NATCOPHARM.NS","GRANULES.NS","LAURUSLABS.NS","GLAND.NS",
+                "NEULANDLAB.NS","JBCHEPHARM.NS","APLLTD.NS","CAPLIPOINT.NS","ERIS.NS",
+                "WOCKPHARMA.NS","JUBLPHARMA.NS","PPLPHARMA.NS","BIOCON.NS","CONCORDBIO.NS",
+                "SYNGENE.NS","AKUMS.NS","EMCURE.NS","SAILIFE.NS","BLUEJET.NS","ONESOURCE.NS",
+                "COHANCE.NS","SENORES.NS");
+
+            Add("Healthcare Services",
+                "APOLLOHOSP.NS","MAXHEALTH.NS","FORTIS.NS","MEDANTA.NS","LALPATHLAB.NS",
+                "METROPOLIS.NS","VIJAYA.NS","RAINBOW.NS","KIMS.NS","ASTERDM.NS","NH.NS",
+                "POLYMED.NS","IKS.NS","SAGILITY.NS","GPTHEALTH.NS");
+
+            Add("FMCG",
+                "ITC.NS","HINDUNILVR.NS","NESTLEIND.NS","BRITANNIA.NS","DABUR.NS","MARICO.NS",
+                "GODREJCP.NS","COLPAL.NS","TATACONSUM.NS","VBL.NS","UNITDSPR.NS","UBL.NS",
+                "RADICO.NS","PATANJALI.NS","GODFRYPHLP.NS","EMAMILTD.NS","JYOTHYLAB.NS",
+                "GILLETTE.NS","PGHH.NS","BIKAJI.NS","CCL.NS","LTFOODS.NS","HONASA.NS",
+                "DOMS.NS","BALRAMCHIN.NS","TRIVENI.NS","EIDPARRY.NS","GODREJAGRO.NS",
+                "SANSTAR.NS","GODAVARIB.NS","JUBLFOOD.NS","SAPPHIRE.NS","DEVYANI.NS");
+
+            Add("Metals & Mining",
+                "TATASTEEL.NS","JSWSTEEL.NS","JINDALSTEL.NS","SAIL.NS","HINDALCO.NS",
+                "VEDL.NS","HINDZINC.NS","NATIONALUM.NS","NMDC.NS","COALINDIA.NS",
+                "HINDCOPPER.NS","APLAPOLLO.NS","JSL.NS","JINDALSAW.NS","WELCORP.NS",
+                "MAHSEAMLES.NS","SHYAMMETL.NS","SARDAEN.NS","GPIL.NS","GRAVITA.NS",
+                "USHAMART.NS","LLOYDSME.NS","GMDCLTD.NS","MMTC.NS","GRAPHITE.NS","HEG.NS");
+
+            Add("Oil, Gas & Energy",
+                "RELIANCE.NS","ONGC.NS","IOC.NS","BPCL.NS","HINDPETRO.NS","GAIL.NS","OIL.NS",
+                "MRPL.NS","CHENNPETRO.NS","PETRONET.NS","IGL.NS","MGL.NS","GUJGASLTD.NS",
+                "GSPL.NS","ATGL.NS","AEGISLOG.NS","AEGISVOPAK.NS","SWANCORP.NS");
+
+            Add("Power & Utilities",
+                "NTPC.NS","POWERGRID.NS","TATAPOWER.NS","ADANIPOWER.NS","ADANIENSOL.NS",
+                "JSWENERGY.NS","TORNTPOWER.NS","NHPC.NS","SJVN.NS","NLCINDIA.NS","CESC.NS",
+                "RPOWER.NS","RELINFRA.NS","JPPOWER.NS","NAVA.NS","NTPCGREEN.NS");
+
+            Add("Renewable Energy",
+                "ADANIGREEN.NS","SUZLON.NS","WAAREEENER.NS","INOXWIND.NS","PREMIERENE.NS",
+                "ACMESOLAR.NS","VIKRAMSOLR.NS");
+
+            Add("Cement & Building Materials",
+                "ULTRACEMCO.NS","SHREECEM.NS","AMBUJACEM.NS","ACC.NS","JKCEMENT.NS",
+                "RAMCOCEM.NS","DALBHARAT.NS","INDIACEM.NS","NUVOCO.NS","JSWCEMENT.NS",
+                "ASTRAL.NS","SUPREMEIND.NS","FINPIPE.NS","CENTURYPLY.NS","KAJARIACER.NS",
+                "CERA.NS","GRSE.NS");
+
+            Add("Capital Goods & Industrials",
+                "LT.NS","SIEMENS.NS","ABB.NS","CGPOWER.NS","BHEL.NS","CUMMINSIND.NS",
+                "THERMAX.NS","POLYCAB.NS","HAVELLS.NS","KEI.NS","APARINDS.NS","FINCABLES.NS",
+                "RRKABEL.NS","AIAENG.NS","HONAUT.NS","CARBORUNIV.NS","ELGIEQUIP.NS",
+                "KIRLOSBROS.NS","KIRLOSENG.NS","KSB.NS","TIMKEN.NS","SKFINDIA.NS",
+                "SCHNEIDER.NS","ACE.NS","PRAJIND.NS","TECHNOE.NS","TRITURBINE.NS","KEC.NS",
+                "ENGINERSIN.NS","3MINDIA.NS","RHIM.NS","TARIL.NS","JYOTICNC.NS",
+                "INOXINDIA.NS","JWL.NS","TITAGARH.NS","PTCIL.NS","NETWEB.NS","OSWALPUMPS.NS",
+                "INTERARCH.NS","HBLENGINE.NS","EPACK.NS","JNKINDIA.NS","UNIMECH.NS",
+                "AJAXENGG.NS","CARRARO.NS","TRANSRAILL.NS","ELECON.NS");
+
+            Add("Defence & Aerospace",
+                "HAL.NS","BEL.NS","BDL.NS","MAZDOCK.NS","COCHINSHIP.NS","BEML.NS",
+                "ZENTEC.NS","DATAPATTNS.NS","SOLARINDS.NS","ITI.NS","GRSE.NS");
+
+            Add("Telecom",
+                "BHARTIARTL.NS","BHARTIHEXA.NS","IDEA.NS","INDUSTOWER.NS","TATACOMM.NS",
+                "TTML.NS","RAILTEL.NS","TEJASNET.NS","HFCL.NS","ITI.NS");
+
+            Add("Consumer Durables & Electricals",
+                "TITAN.NS","VOLTAS.NS","HAVELLS.NS","CROMPTON.NS","BLUESTARCO.NS","DIXON.NS",
+                "AMBER.NS","WHIRLPOOL.NS","VGUARD.NS","KAYNES.NS","SYRMA.NS","PGEL.NS",
+                "EXICOM.NS");
+
+            Add("Retail & Apparel",
+                "DMART.NS","TRENT.NS","ABFRL.NS","ABLBL.NS","KALYANKJIL.NS","PAGEIND.NS",
+                "MANYAVAR.NS","CAMPUS.NS","BATAINDIA.NS","VMM.NS","STYLEBAAZA.NS");
+
+            Add("Realty",
+                "DLF.NS","GODREJPROP.NS","LODHA.NS","OBEROIRLTY.NS","PHOENIXLTD.NS",
+                "PRESTIGE.NS","BRIGADE.NS","SOBHA.NS","ANANTRAJ.NS","DBREALTY.NS",
+                "SIGNATURE.NS","ABREL.NS","ARKADE.NS","ARISINFRA.NS","KALPATARU.NS");
+
+            Add("Chemicals & Agrochemicals",
+                "PIDILITIND.NS","SRF.NS","UPL.NS","PIIND.NS","DEEPAKNTR.NS","AARTIIND.NS",
+                "ATUL.NS","NAVINFLUOR.NS","ALKYLAMINE.NS","BASF.NS","BAYERCROP.NS",
+                "SUMICHEM.NS","TATACHEM.NS","GODREJIND.NS","FLUOROCHEM.NS","LINDEINDIA.NS",
+                "CLEAN.NS","PCBL.NS","HSCL.NS","JUBLINGREA.NS","COROMANDEL.NS",
+                "CHAMBLFERT.NS","DEEPAKFERT.NS","RCF.NS","FACT.NS","DCMSHRIRAM.NS");
+
+            Add("Textiles",
+                "KPRMILL.NS","TRIDENT.NS","VTL.NS","WELSPUNLIV.NS",
+                "ALOKINDS.NS","SANATHAN.NS");
+
+            Add("Media & Entertainment",
+                "ZEEL.NS","SUNTV.NS","PVRINOX.NS","SAREGAMA.NS");
+
+            Add("Hospitality & Travel",
+                "INDHOTEL.NS","ITCHOTELS.NS","EIHOTEL.NS","LEMONTREE.NS","CHALET.NS",
+                "IRCTC.NS","INDIGO.NS","GMRAIRPORT.NS","THELEELA.NS","VENTIVE.NS",
+                "BRIGHOTEL.NS","PARKHOTELS.NS");
+
+            Add("Infrastructure & Construction",
+                "ADANIPORTS.NS","ADANIENT.NS","IRB.NS","RVNL.NS","NBCC.NS","NCC.NS",
+                "KPIL.NS","IRCON.NS","RITES.NS","AFCONS.NS","CONCOR.NS","JSWINFRA.NS",
+                "CEIGALL.NS","GESHIP.NS","SCI.NS","BLUEDART.NS","DELHIVERY.NS","BLS.NS",
+                "INDIQUBE.NS","SMARTWORKS.NS","AWFIS.NS");
+
+            Add("Diversified / Conglomerate",
+                "GRASIM.NS","BBTC.NS","BAJAJHLDNG.NS","3MINDIA.NS",
+                "AUTHUM.NS","AIIL.NS");
+
+            Add("Diamond, Jewellery & Retail Gold",
+                "TITAN.NS","KALYANKJIL.NS","IGIL.NS");
+
+            return map;
+        }
+    }
+
+    // =========================================================================
+    //  REFERENCE DATA PROVIDER  (v4.1)
+    // -----------------------------------------------------------------------
+    //  Loads an optional CSV (data/reference.csv by default) once per scan and
+    //  serves three things off it: a sector override (takes priority over
+    //  SectorMap's built-in guesses), fundamentals (PE/ROE/D-E/EPS growth/
+    //  promoter pledge), and next-earnings-date. This is deliberately CSV-driven
+    //  rather than an extra unofficial Yahoo endpoint call per ticker — the
+    //  scanner already manages Yahoo rate-limit risk carefully (MaxConcurrentFetches,
+    //  retry/backoff, disk cache), and doubling that traffic for fundamentals
+    //  that are often missing/unreliable for small/mid caps on Yahoo anyway is a
+    //  bad trade. Point this at your own vendor export, a screener.in/Tijori
+    //  download, or maintain it by hand for the names you actually care about.
+    //
+    //  CSV format (header required, columns can be in any order, extra columns
+    //  are ignored):
+    //    symbol,sector,pe,roe_pct,debt_to_equity,eps_growth_pct,promoter_pledge_pct,next_earnings_date
+    //    TCS.NS,IT Services,28.4,52.1,0.0,8.2,0,2026-10-14
+    //    RELIANCE.NS,,24.1,9.8,0.42,,,
+    //
+    //  Every field except "symbol" is optional — an empty cell means "unknown"
+    //  and every gate that reads this data treats unknown as neutral/non-blocking,
+    //  never as a reason to exclude a stock. Missing the whole file is equally
+    //  safe: sector falls back fully to SectorMap's built-in table, and the
+    //  fundamental/earnings gates simply never fire.
+    // =========================================================================
+    internal static class ReferenceDataProvider
+    {
+        private static Dictionary<string, ReferenceRecord> _records =
+            new(StringComparer.OrdinalIgnoreCase);
+        private static bool _loaded;
+
+        public static int LoadedCount => _records.Count;
+        public static bool WasLoaded => _loaded;
+
+        /// <summary>Idempotent per-process-run; call once at scan startup. Never throws — a
+        /// missing or malformed file degrades to "no reference data" rather than failing the scan.</summary>
+        public static void Load(string csvPath)
+        {
+            _records = new Dictionary<string, ReferenceRecord>(StringComparer.OrdinalIgnoreCase);
+            _loaded = false;
+
+            if (string.IsNullOrWhiteSpace(csvPath) || !File.Exists(csvPath))
+            {
+                Log.Information("Reference data: {Path} not found — sector falls back to the " +
+                    "built-in map; fundamental/earnings gates have no data to work with (safe no-op).",
+                    csvPath);
+                return;
+            }
+
+            try
+            {
+                using var reader = new StreamReader(csvPath);
+                string? headerLine = reader.ReadLine();
+                if (headerLine == null) { Log.Warning("Reference data: {Path} is empty.", csvPath); return; }
+
+                var headers = SplitCsvLine(headerLine);
+                var colIdx = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                for (int i = 0; i < headers.Count; i++) colIdx[headers[i].Trim()] = i;
+
+                if (!colIdx.ContainsKey("symbol"))
+                {
+                    Log.Warning("Reference data: {Path} has no 'symbol' column — ignoring file.", csvPath);
+                    return;
+                }
+
+                int lineNo = 1, parsed = 0, malformed = 0;
+                string? line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    lineNo++;
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    var cells = SplitCsvLine(line);
+
+                    string Get(string col) =>
+                        colIdx.TryGetValue(col, out var idx) && idx < cells.Count ? cells[idx].Trim() : "";
+
+                    string symbol = Get("symbol");
+                    if (string.IsNullOrWhiteSpace(symbol)) { malformed++; continue; }
+
+                    var rec = new ReferenceRecord
+                    {
+                        Symbol            = symbol,
+                        Sector            = NullIfEmpty(Get("sector")),
+                        PeRatio           = ParseNullableDouble(Get("pe")),
+                        RoePct            = ParseNullableDouble(Get("roe_pct")),
+                        DebtToEquity      = ParseNullableDouble(Get("debt_to_equity")),
+                        EpsGrowthPct      = ParseNullableDouble(Get("eps_growth_pct")),
+                        PromoterPledgePct = ParseNullableDouble(Get("promoter_pledge_pct")),
+                        NextEarningsDate  = ParseNullableDate(Get("next_earnings_date")),
+                    };
+                    _records[symbol] = rec;
+                    parsed++;
+                }
+
+                _loaded = true;
+                Log.Information("Reference data: loaded {N} symbols from {Path}{Warn}",
+                    parsed, csvPath, malformed > 0 ? $" ({malformed} rows skipped — missing symbol)" : "");
+            }
+            catch (Exception ex)
+            {
+                Log.Warning("Reference data: failed to read {Path}: {Msg} — proceeding without it.",
+                    csvPath, ex.Message);
+                _records = new Dictionary<string, ReferenceRecord>(StringComparer.OrdinalIgnoreCase);
+                _loaded = false;
+            }
+        }
+
+        /// <summary>CSV override (if present and non-empty) → built-in SectorMap → "Unclassified".</summary>
+        public static string GetSector(string symbol)
+        {
+            if (_records.TryGetValue(symbol, out var rec) && !string.IsNullOrWhiteSpace(rec.Sector))
+                return rec.Sector!;
+            return SectorMap.TryGetBuiltin(symbol) ?? "Unclassified";
+        }
+
+        public static ReferenceRecord? TryGetRecord(string symbol) =>
+            _records.TryGetValue(symbol, out var rec) ? rec : null;
+
+        private static string? NullIfEmpty(string s) => string.IsNullOrWhiteSpace(s) ? null : s;
+
+        private static double? ParseNullableDouble(string s) =>
+            double.TryParse(s, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var v) ? v : null;
+
+        private static DateTime? ParseNullableDate(string s) =>
+            DateTime.TryParse(s, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.None, out var d) ? d.Date : null;
+
+        /// <summary>Minimal CSV splitter — handles quoted cells with embedded commas, which is
+        /// all this file's simple numeric/date/symbol columns ever need. Not a full RFC 4180
+        /// parser (no embedded newlines inside quotes), which is fine for this use case.</summary>
+        private static List<string> SplitCsvLine(string line)
+        {
+            var cells = new List<string>();
+            var sb = new System.Text.StringBuilder();
+            bool inQuotes = false;
+            foreach (char c in line)
+            {
+                if (c == '"') { inQuotes = !inQuotes; continue; }
+                if (c == ',' && !inQuotes) { cells.Add(sb.ToString()); sb.Clear(); continue; }
+                sb.Append(c);
+            }
+            cells.Add(sb.ToString());
+            return cells;
+        }
+    }
+
     // =========================================================================
     //  YAHOO FINANCE INTERVAL HELPER
     // =========================================================================
@@ -1171,6 +1863,143 @@ namespace NseMomentumScanner
     }
 
     // =========================================================================
+    //  MARKET REGIME ANALYZER  (v4.0)
+    //  Classifies the broad market off a single benchmark index fetch, so BUY
+    //  generation can respect "don't fight the market" instead of scoring every
+    //  stock in a vacuum. Also holds the benchmark's own daily closes for the
+    //  relative-strength calculator below (one shared series, not refetched
+    //  per ticker).
+    // =========================================================================
+    internal static class MarketRegimeAnalyzer
+    {
+        /// <summary>
+        /// Regime classification off the benchmark's own trend structure:
+        ///   BULLISH — close above both EMA50 and EMA200, and EMA50 above EMA200 (uptrend intact)
+        ///   BEARISH — close below EMA200 (the standard long-term trend line)
+        ///   NEUTRAL — everything else (e.g. above EMA200 but below EMA50, or EMAs crossed but
+        ///             price hasn't confirmed either way) — a chop/transition zone
+        /// </summary>
+        public static string Classify(decimal close, double ema50, double ema200)
+        {
+            if (ema200 <= 0) return "NEUTRAL"; // not enough history yet
+            if ((double)close > ema50 && ema50 > ema200) return "BULLISH";
+            if ((double)close < ema200) return "BEARISH";
+            return "NEUTRAL";
+        }
+
+        /// <summary>
+        /// Fetches the benchmark once, computes EMA50/EMA200 across its whole history, and
+        /// returns both the regime for <paramref name="asOf"/> and the full date→close map the
+        /// RS calculator needs. Never throws — a benchmark fetch failure degrades to a NEUTRAL
+        /// regime (no gating) rather than blocking the whole scan.
+        /// </summary>
+        public static async Task<(MarketRegimeInfo Regime, Dictionary<DateTime, decimal> CloseByDate)>
+            BuildAsync(YahooDataFetcher fetcher, DateTime asOf, CancellationToken ct)
+        {
+            var info = new MarketRegimeInfo { ScanDate = asOf, BenchmarkSymbol = Config.MarketBenchmarkSymbol };
+            var closeByDate = new Dictionary<DateTime, decimal>();
+
+            try
+            {
+                var quotes = await fetcher.FetchAsync(
+                    Config.MarketBenchmarkSymbol, YahooInterval.OneDay,
+                    Config.MarketRegimeLookbackDays, ct);
+
+                if (quotes.Count < Config.MarketRegimeEmaSlowPeriod)
+                {
+                    Log.Warning("Benchmark {Sym} has only {N} bars — regime defaults to NEUTRAL " +
+                                "(no gating applied) until enough history is available.",
+                                Config.MarketBenchmarkSymbol, quotes.Count);
+                    return (info, closeByDate);
+                }
+
+                foreach (var q in quotes) closeByDate[q.Date.Date] = q.Close;
+
+                var ema50  = quotes.GetEma(Config.MarketRegimeEmaFastPeriod).ToArray();
+                var ema200 = quotes.GetEma(Config.MarketRegimeEmaSlowPeriod).ToArray();
+
+                int last = quotes.Count - 1;
+                double e50  = ema50[last].Ema  ?? 0;
+                double e200 = ema200[last].Ema ?? 0;
+
+                info.BenchmarkClose = quotes[last].Close;
+                info.Ema50          = e50;
+                info.Ema200         = e200;
+                info.Regime         = Classify(quotes[last].Close, e50, e200);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning("Benchmark fetch failed ({Sym}): {Msg} — regime defaults to NEUTRAL.",
+                    Config.MarketBenchmarkSymbol, ex.Message);
+            }
+
+            return (info, closeByDate);
+        }
+
+        /// <summary>Fills in breadth (computed from the universe's own daily results) — done
+        /// separately from BuildAsync since breadth needs every ticker already scored.</summary>
+        public static void ApplyBreadth(MarketRegimeInfo info, int bullish, int bearish, int total)
+        {
+            info.BreadthBullish    = bullish;
+            info.BreadthBearish    = bearish;
+            info.BreadthTotal      = total;
+            info.BreadthPctBullish = total > 0 ? Math.Round(bullish * 100.0 / total, 1) : 0;
+        }
+    }
+
+    // =========================================================================
+    //  RELATIVE STRENGTH CALCULATOR  (v4.0, IBD-style)
+    //  Blends trailing returns over ~3/6/9/12 months against the benchmark's return over the
+    //  same window, weighting the most recent quarter double the other three — the standard
+    //  IBD RS Rating construction. Produces a raw per-stock number; MultiTfAggregator converts
+    //  that into a cross-sectional 1-99 percentile rank once every ticker for the date is in.
+    //  Index-based, no allocations beyond the small period array — safe to call per scored date.
+    // =========================================================================
+    internal static class RelativeStrengthCalculator
+    {
+        public static double ComputeRaw(
+            List<StockQuote> quotes, int cutoffIdx,
+            IReadOnlyDictionary<DateTime, decimal> benchmarkCloseByDate,
+            out bool hasData)
+        {
+            hasData = false;
+            if (cutoffIdx <= 0 || benchmarkCloseByDate.Count == 0) return 0;
+
+            decimal closeNow = quotes[cutoffIdx].Close;
+            if (!benchmarkCloseByDate.TryGetValue(quotes[cutoffIdx].Date.Date, out var benchNow))
+                return 0; // no matching benchmark bar for this date (holiday mismatch etc.)
+
+            double blended = 0, weightUsed = 0;
+            var periods = Config.RsLookbackTradingDays;
+            var weights = Config.RsLookbackWeights;
+
+            for (int p = 0; p < periods.Length; p++)
+            {
+                int lookIdx = cutoffIdx - periods[p];
+                if (lookIdx < 0) continue; // not enough history for this window yet — skip it
+
+                decimal closeThen = quotes[lookIdx].Close;
+                if (closeThen <= 0) continue;
+                if (!benchmarkCloseByDate.TryGetValue(quotes[lookIdx].Date.Date, out var benchThen) || benchThen <= 0)
+                    continue;
+
+                double stockRet = (double)((closeNow - closeThen) / closeThen);
+                double benchRet = (double)((benchNow - benchThen) / benchThen);
+                double relative = stockRet - benchRet; // outperformance vs benchmark over this window
+
+                blended += relative * weights[p];
+                weightUsed += weights[p];
+            }
+
+            // Renormalize if some windows were skipped (thin history) so a new-ish listing still
+            // gets a usable (if less confident) RS figure from whatever windows it does have.
+            if (weightUsed <= 0) return 0;
+            hasData = true;
+            return blended / weightUsed;
+        }
+    }
+
+    // =========================================================================
     //  TICKER SCORER  (index-based, zero List.GetRange / Take().ToList())
     // =========================================================================
     internal static class TickerScorer
@@ -1182,10 +2011,16 @@ namespace NseMomentumScanner
             bool             vcpEnabled,
             List<StockQuote> quotes,
             DateTime         scoreStart,
-            DateTime         scoreEnd)
+            DateTime         scoreEnd,
+            IReadOnlyDictionary<DateTime, decimal>? benchmarkCloseByDate = null)
         {
             var results = new List<ScanResult>();
             if (quotes.Count < Config.MinQuotesRequired) return results;
+
+            // RS/liquidity/extension/ATR are computed only on the daily timeframe: it's the only
+            // one with a matching benchmark series and a stable, non-noisy ATR. Other timeframes
+            // keep these fields at their zero/false defaults.
+            bool isDaily = tfLabel == "1d";
 
             // Pre-compute ALL indicators once — O(n) per indicator, no per-date work
             var ind = IndicatorArrays.Compute(quotes);
@@ -1253,6 +2088,34 @@ namespace NseMomentumScanner
                 var levels  = PriceLevelCalculator.Calculate(quotes, i);
                 var stm     = SupertrendMetricsCalculator.Calculate(quotes, ind.SuperTrend, i);
 
+                // ── v4.0: relative strength / liquidity / extension / ATR risk levels ────
+                double rsRaw = 0, avgTurnover = 0, extensionPct = 0, atrVal = 0, stop = 0, target = 0;
+                bool liquid = true, extended = false, hasRs = false;
+
+                if (isDaily)
+                {
+                    if (benchmarkCloseByDate != null)
+                        rsRaw = RelativeStrengthCalculator.ComputeRaw(quotes, i, benchmarkCloseByDate, out hasRs);
+
+                    avgTurnover = volSma * (double)q.Close;
+                    liquid = avgTurnover >= Config.MinAvgTurnoverInr && (double)q.Close >= Config.MinPriceInr;
+
+                    // Extension: how far price has run above the 50-EMA since a fresh entry near
+                    // the EMA is a very different trade than chasing one already 25%+ above it.
+                    if (ef > 0)
+                    {
+                        extensionPct = ((double)q.Close - ef) / ef * 100.0;
+                        extended = extensionPct > Config.MaxExtensionAboveEma50Pct;
+                    }
+
+                    atrVal = i < ind.Atr.Length ? (ind.Atr[i].Atr ?? 0) : 0;
+                    if (atrVal > 0)
+                    {
+                        stop   = (double)q.Close - atrVal * Config.LiveAtrStopMultiplier;
+                        target = (double)q.Close + atrVal * Config.LiveAtrStopMultiplier * Config.LiveRiskRewardRatio;
+                    }
+                }
+
                 results.Add(new ScanResult
                 {
                     Symbol = symbol, ScanDate = scoreDate, Timeframe = tfLabel,
@@ -1267,6 +2130,9 @@ namespace NseMomentumScanner
                     AvgVolume = volSma, VolumeRatio = volRatio,
                     AdxValue = adx, PdiValue = pdi, MdiValue = mdi,
                     VcpDetected = vcpHit,
+                    RsRaw = rsRaw, HasRs = hasRs, AvgTurnoverInr = avgTurnover, IsLiquid = liquid,
+                    ExtensionPct = extensionPct, IsExtended = extended,
+                    AtrValue = atrVal, SuggestedStop = stop, SuggestedTarget = target,
                     Levels    = levels,
                     StMetrics = stm,
                 });
@@ -1288,9 +2154,16 @@ namespace NseMomentumScanner
         /// aggregate per-ticker per-date into AggregatedResult.
         /// Returns a list sorted by AggregateScore descending, tagged BUY/SELL/HOLD.
         /// </summary>
+        /// <param name="regime">
+        /// v4.0: optional market-regime context (benchmark trend). When supplied, this method
+        /// also fills in <c>regime.Breadth*</c> from the universe's own daily results and uses
+        /// the regime to raise the bar for BUY generation in a bearish/weak-breadth market
+        /// instead of tagging the same volume of buys regardless of what the market is doing.
+        /// </param>
         public static List<AggregatedResult> Aggregate(
             IReadOnlyList<ScanResult> allResults,
-            DateTime scanDate)
+            DateTime scanDate,
+            MarketRegimeInfo? regime = null)
         {
             // Pre-group once: skip LINQ Where/GroupBy every call
             var dayResults = new Dictionary<string, List<ScanResult>>(512);
@@ -1303,6 +2176,9 @@ namespace NseMomentumScanner
             }
 
             var aggList = new List<AggregatedResult>(dayResults.Count);
+            var hasDailyMap = new Dictionary<string, bool>(dayResults.Count, StringComparer.OrdinalIgnoreCase);
+            var hasRsMap    = new Dictionary<string, bool>(dayResults.Count, StringComparer.OrdinalIgnoreCase);
+            int breadthBull = 0, breadthBear = 0, breadthTotal = 0;
 
             foreach (var (sym, grp) in dayResults)
             {
@@ -1310,6 +2186,7 @@ namespace NseMomentumScanner
                 int bullish = 0, bearish = 0;
                 double mo = 0, wk = 0, d1 = 0, h1 = 0, m15 = 0, m5 = 0;
                 ScanResult? best = null;
+                bool hasDaily = false;
 
                 foreach (var r in grp)
                 {
@@ -1326,10 +2203,29 @@ namespace NseMomentumScanner
                         case "15m": m15 = r.TotalScore; break;
                         case "5m":  m5  = r.TotalScore; break;
                     }
-                    if (r.Timeframe == "1d") best = r; else best ??= r;
+                    if (r.Timeframe == "1d") { best = r; hasDaily = true; } else best ??= r;
+                }
+
+                hasDailyMap[sym] = hasDaily;
+                hasRsMap[sym]    = hasDaily && best!.HasRs;
+                if (hasDaily)
+                {
+                    breadthTotal++;
+                    if (d1 > 0) breadthBull++; else if (d1 < 0) breadthBear++;
                 }
 
                 double composite = totalWt > 0 ? Math.Round(wtScore / totalWt, 2) : 0;
+
+                // ── v4.1: sector (CSV override > built-in map) + fundamentals + earnings ──
+                string sector = ReferenceDataProvider.GetSector(sym);
+                var refRec = ReferenceDataProvider.TryGetRecord(sym);
+                bool inEarningsBlackout = false;
+                if (refRec?.NextEarningsDate is DateTime nextEarnings)
+                {
+                    int daysToEarnings = (nextEarnings.Date - scanDate.Date).Days;
+                    inEarningsBlackout = daysToEarnings >= 0 && daysToEarnings <= Config.EarningsBlackoutDays;
+                }
+
                 aggList.Add(new AggregatedResult
                 {
                     Symbol         = sym,  ScanDate    = scanDate,
@@ -1340,34 +2236,195 @@ namespace NseMomentumScanner
                     BullishTfCount = bullish, BearishTfCount = bearish,
                     LastClose      = best?.LastClose ?? 0,
                     DataSourceTf   = best?.Timeframe ?? string.Empty,
+                    // v4.0: only trust these when the daily TF actually scored this symbol —
+                    // otherwise default to non-blocking (liquid/not-extended) rather than
+                    // silently disqualifying a stock whose daily fetch simply failed.
+                    RsRaw           = hasDaily ? best!.RsRaw          : 0,
+                    AvgTurnoverInr  = hasDaily ? best!.AvgTurnoverInr : 0,
+                    IsLiquid        = hasDaily ? best!.IsLiquid       : true,
+                    ExtensionPct    = hasDaily ? best!.ExtensionPct   : 0,
+                    IsExtended      = hasDaily ? best!.IsExtended     : false,
+                    AtrValue        = hasDaily ? best!.AtrValue       : 0,
+                    SuggestedStop   = hasDaily ? best!.SuggestedStop  : 0,
+                    SuggestedTarget = hasDaily ? best!.SuggestedTarget: 0,
+                    // v4.1
+                    Sector             = sector,
+                    PeRatio            = refRec?.PeRatio,
+                    RoePct             = refRec?.RoePct,
+                    DebtToEquity       = refRec?.DebtToEquity,
+                    EpsGrowthPct       = refRec?.EpsGrowthPct,
+                    PromoterPledgePct  = refRec?.PromoterPledgePct,
+                    NextEarningsDate   = refRec?.NextEarningsDate,
+                    InEarningsBlackout = inEarningsBlackout,
                     Levels         = best?.Levels    ?? new(),
                     StMetrics      = best?.StMetrics ?? new(),
                 });
             }
 
-            // Sort and tag
+            if (regime != null)
+                MarketRegimeAnalyzer.ApplyBreadth(regime, breadthBull, breadthBear, breadthTotal);
+
+            // Sort by composite score desc
             aggList.Sort((a, b) => b.AggregateScore.CompareTo(a.AggregateScore));
 
-            int buyCount = 0, sellCount = 0;
+            // ── v4.0: cross-sectional Relative Strength percentile rank (1-99, IBD-style) ──
+            // rsGateActive is FALSE whenever nobody in this call had real benchmark-backed RS
+            // data at all — e.g. the backtest engine's own Aggregate() calls, or a live run
+            // where the benchmark fetch failed outright. In that case the RS gate is skipped
+            // entirely rather than defaulting every stock to the neutral midpoint: with zero
+            // real RsRaw values to rank, a naive percentile-by-position would tie-break on
+            // aggList's existing score-sorted order and produce an RS "ranking" that's really
+            // just an inverted copy of the composite score — silently corrupting BUY selection
+            // instead of just not gating on RS when there's nothing to gate on.
+            bool rsGateActive = hasRsMap.Values.Any(v => v);
+            if (rsGateActive)
+            {
+                var rsEligible = aggList
+                    .Where(a => hasRsMap.TryGetValue(a.Symbol, out var hr) && hr)
+                    .OrderBy(a => a.RsRaw)
+                    .ToList();
+                int nRs = rsEligible.Count;
+                for (int i = 0; i < nRs; i++)
+                    rsEligible[i].RsRank = nRs > 1 ? Math.Round(1 + i * 98.0 / (nRs - 1), 1) : 50;
+                foreach (var a in aggList)
+                    if (!(hasRsMap.TryGetValue(a.Symbol, out var hr) && hr))
+                        a.RsRank = 50; // no RS data for this specific stock — neutral, gated out by default
+            }
+
+            // ── v4.1: sector rotation — rank each sector by its stocks' average composite
+            // score among daily-scored names, then give every stock its sector's percentile.
+            // This is informational by default (dashboard + DB); Config.EnableSectorGate turns
+            // it into an actual BUY gate. Sectors with only 1-2 scanned names are excluded from
+            // ranking (too little signal to call a whole sector "leading") but their member
+            // stocks still get the neutral midpoint so they're never wrongly gated either way.
+            var sectorGroups = aggList
+                .Where(a => hasDailyMap.TryGetValue(a.Symbol, out var hd) && hd)
+                .GroupBy(a => a.Sector)
+                .Where(g => g.Count() >= 3)
+                .Select(g => new { Sector = g.Key, Avg = g.Average(a => a.AggregateScore) })
+                .OrderBy(x => x.Avg)
+                .ToList();
+            int nSec = sectorGroups.Count;
+            var sectorRankMap = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < nSec; i++)
+                sectorRankMap[sectorGroups[i].Sector] = nSec > 1 ? Math.Round(1 + i * 98.0 / (nSec - 1), 1) : 50;
+            foreach (var a in aggList)
+                a.SectorRankPercentile = sectorRankMap.TryGetValue(a.Sector, out var sr) ? sr : 50;
+
+
+            // A confirmed bearish benchmark trend, or weak universe breadth, raises the score
+            // bar and shrinks how many names can be tagged BUY at all — the scanner should
+            // generate fewer, higher-conviction signals when the market itself isn't
+            // confirming them, not the same volume of buys regardless of context.
+            string regimeLabel  = regime?.Regime ?? "NEUTRAL";
+            bool weakBreadth    = regime != null && regime.BreadthTotal > 0 &&
+                                   regime.BreadthPctBullish < Config.MinBullishBreadthPctForBuy;
+            bool defensiveMode  = regimeLabel == "BEARISH" || weakBreadth;
+
+            double buyScoreThreshold = 20.0 + (defensiveMode ? Config.BearRegimeScoreThresholdBonus : 0);
+            int    effectiveTopBuy   = defensiveMode
+                ? Math.Max(1, Config.TopBuyCount / Math.Max(1, Config.BearRegimeBuyCountDivisor))
+                : Config.TopBuyCount;
+
+            int buyCount = 0;
             for (int r = 0; r < aggList.Count; r++)
             {
-                aggList[r].Rank = r + 1;
-                if (buyCount  < Config.TopBuyCount  && aggList[r].AggregateScore >= 20)
-                { aggList[r].RecommendationType = "BUY";           buyCount++;  }
-                else if (sellCount < Config.TopSellCount)
+                var a = aggList[r];
+                a.Rank = r + 1;
+                if (buyCount >= effectiveTopBuy) continue;
+
+                bool passScore     = a.AggregateScore >= buyScoreThreshold;
+                if (!passScore) continue; // don't bother gating stocks nowhere near the bar
+
+                bool passTfAlign   = a.BullishTfCount >= Config.MinBullishTfCountForBuy && a.WeeklyScore >= 0;
+                bool passRs        = !rsGateActive || a.RsRank >= Config.MinRsRankForBuy;
+                bool passLiquidity = a.IsLiquid;
+                bool passExtension = !a.IsExtended;
+
+                // v4.1: fundamental screen — OFF by default; when on, "unknown" (no reference.csv
+                // row, or a field the CSV left blank) is always treated as passing, never blocking.
+                bool passFundamental = true;
+                if (Config.EnableFundamentalScreen)
                 {
-                    // Scan from bottom for sells
+                    if (a.RoePct is double roe && roe < Config.MinRoePctForBuy) passFundamental = false;
+                    if (a.DebtToEquity is double de && de > Config.MaxDebtToEquityForBuy) passFundamental = false;
+                    if (a.PromoterPledgePct is double pledge && pledge > Config.MaxPromoterPledgePctForBuy) passFundamental = false;
+                    if (Config.MinEpsGrowthPctForBuy is double minEps &&
+                        a.EpsGrowthPct is double eps && eps < minEps) passFundamental = false;
+                }
+
+                // v4.1: earnings blackout — ON by default, but only ever fires when a
+                // next_earnings_date is actually known for this symbol (see ReferenceDataProvider).
+                bool passEarnings = !(Config.EnableEarningsBlackout && a.InEarningsBlackout);
+
+                // v4.1: sector rotation gate — OFF by default (informational-only until enabled).
+                bool passSector = !Config.EnableSectorGate || a.SectorRankPercentile >= Config.MinSectorRankPercentileForBuy;
+
+                if (passTfAlign && passRs && passLiquidity && passExtension &&
+                    passFundamental && passEarnings && passSector)
+                {
+                    a.RecommendationType = "BUY";
+                    buyCount++;
+                }
+                else
+                {
+                    // Close enough on the composite score to have been a buy pre-v4.0, but
+                    // blocked by a quality gate — surfaced on the dashboard instead of silently
+                    // dropped, so it's clear WHY a familiar name isn't showing up as a BUY today.
+                    var reasons = new List<string>(6);
+                    if (!passTfAlign)     reasons.Add("weak TF alignment");
+                    if (!passRs)          reasons.Add("weak RS vs Nifty");
+                    if (!passLiquidity)   reasons.Add("low liquidity");
+                    if (!passExtension)   reasons.Add("extended from 50-EMA");
+                    if (!passFundamental) reasons.Add("fails fundamental screen");
+                    if (!passEarnings)    reasons.Add($"earnings within {Config.EarningsBlackoutDays}d");
+                    if (!passSector)      reasons.Add("weak sector");
+                    a.GateReason = string.Join(", ", reasons);
                 }
             }
-            // Tag sells from the bottom
-            sellCount = 0;
+
+            // Tag sells from the bottom — same TF-coherence discipline as BUY, so a sell isn't
+            // driven by one noisy intraday timeframe against an otherwise-neutral weekly trend.
+            int sellCount = 0;
             for (int r = aggList.Count - 1; r >= 0 && sellCount < Config.TopSellCount; r--)
             {
-                if (aggList[r].AggregateScore <= -20)
-                { aggList[r].RecommendationType = "IMMEDIATE_SELL"; sellCount++; }
+                var a = aggList[r];
+                bool passScore   = a.AggregateScore <= -20;
+                if (!passScore) continue;
+
+                bool passTfAlign = a.BearishTfCount >= Config.MinBearishTfCountForSell && a.WeeklyScore <= 0;
+                if (passTfAlign)
+                {
+                    a.RecommendationType = "IMMEDIATE_SELL";
+                    sellCount++;
+                }
             }
 
             return aggList;
+        }
+
+        /// <summary>
+        /// v4.1: rolls up an already-aggregated day into per-sector stats for the dashboard's
+        /// Sector Rotation panel — how many stocks per sector, how many bullish, average score,
+        /// average RS, and the same rank percentile used internally for Config.EnableSectorGate.
+        /// Sectors with fewer than 3 scanned names are still included (so nothing silently
+        /// disappears) but flagged low-confidence via a small StockCount the dashboard can grey out.
+        /// </summary>
+        public static List<SectorRotationRow> BuildSectorRotationSummary(IReadOnlyList<AggregatedResult> aggList)
+        {
+            return aggList
+                .GroupBy(a => a.Sector)
+                .Select(g => new SectorRotationRow
+                {
+                    Sector         = g.Key,
+                    StockCount     = g.Count(),
+                    BullishCount   = g.Count(a => a.AggregateScore > 0),
+                    AvgScore       = Math.Round(g.Average(a => a.AggregateScore), 2),
+                    AvgRsRaw       = Math.Round(g.Average(a => a.RsRaw), 4),
+                    RankPercentile = g.Max(a => a.SectorRankPercentile), // same for every member; Max just extracts it
+                })
+                .OrderByDescending(s => s.RankPercentile)
+                .ToList();
         }
     }
     // =========================================================================
@@ -1408,7 +2465,8 @@ namespace NseMomentumScanner
                 run_timestamp  TEXT NOT NULL,
                 universe       TEXT NOT NULL,
                 total_tickers  INTEGER NOT NULL DEFAULT 0,
-                scored_tickers INTEGER NOT NULL DEFAULT 0
+                scored_tickers INTEGER NOT NULL DEFAULT 0,
+                weight_source  TEXT NOT NULL DEFAULT 'default'
             );
 
             CREATE TABLE IF NOT EXISTS scan_results (
@@ -1430,6 +2488,9 @@ namespace NseMomentumScanner
                 st_bullish       INTEGER, st_days INTEGER,  st_flip_date TEXT, st_cal_days INTEGER,
                 st_hh            REAL,    st_hh_ago INTEGER, st_hl REAL, st_hl_ago INTEGER,
                 st_lh            REAL,    st_lh_ago INTEGER, st_ll REAL, st_ll_ago INTEGER,
+                rs_raw           REAL, avg_turnover_inr REAL, is_liquid INTEGER,
+                extension_pct    REAL, is_extended INTEGER,
+                atr_value        REAL, suggested_stop REAL, suggested_target REAL,
                 UNIQUE (session_id, symbol, scan_date, timeframe)
             );
 
@@ -1447,14 +2508,100 @@ namespace NseMomentumScanner
                 pct_52w_high      REAL, pct_52w_low REAL,
                 st_bullish        INTEGER, st_days INTEGER, st_flip_date TEXT, st_cal_days INTEGER,
                 st_hh             REAL,   st_hh_ago INTEGER, st_ll REAL, st_ll_ago INTEGER,
+                rs_raw            REAL, rs_rank REAL, avg_turnover_inr REAL, is_liquid INTEGER,
+                extension_pct     REAL, is_extended INTEGER,
+                atr_value         REAL, suggested_stop REAL, suggested_target REAL,
+                gate_reason       TEXT,
+                sector            TEXT, sector_rank REAL,
+                pe_ratio          REAL, roe_pct REAL, debt_to_equity REAL, eps_growth_pct REAL,
+                promoter_pledge_pct REAL, next_earnings_date TEXT, in_earnings_blackout INTEGER,
                 UNIQUE (session_id, symbol, scan_date)
+            );
+
+            CREATE TABLE IF NOT EXISTS sector_rotation (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id        INTEGER NOT NULL REFERENCES scan_sessions(session_id) ON DELETE CASCADE,
+                scan_date         TEXT NOT NULL,
+                sector            TEXT NOT NULL,
+                stock_count       INTEGER, bullish_count INTEGER,
+                avg_score         REAL, avg_rs_raw REAL, rank_percentile REAL,
+                UNIQUE (session_id, scan_date, sector)
+            );
+
+            CREATE TABLE IF NOT EXISTS market_regime (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id        INTEGER NOT NULL REFERENCES scan_sessions(session_id) ON DELETE CASCADE,
+                scan_date         TEXT NOT NULL,
+                benchmark_symbol  TEXT NOT NULL,
+                benchmark_close   REAL, ema50 REAL, ema200 REAL,
+                regime            TEXT NOT NULL,
+                breadth_total     INTEGER, breadth_bullish INTEGER, breadth_bearish INTEGER,
+                breadth_pct_bullish REAL,
+                UNIQUE (session_id, scan_date)
+            );
+
+            CREATE TABLE IF NOT EXISTS data_quality_issues (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id        INTEGER NOT NULL REFERENCES scan_sessions(session_id) ON DELETE CASCADE,
+                symbol            TEXT NOT NULL, timeframe TEXT NOT NULL, reason TEXT NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_sr_sym_date  ON scan_results(symbol, scan_date);
             CREATE INDEX IF NOT EXISTS idx_sr_date_tf   ON scan_results(scan_date, timeframe);
             CREATE INDEX IF NOT EXISTS idx_sr_score     ON scan_results(scan_date, total_score DESC);
             CREATE INDEX IF NOT EXISTS idx_agg_date_rec ON aggregated_results(scan_date, recommendation);
+            CREATE INDEX IF NOT EXISTS idx_dq_session    ON data_quality_issues(session_id);
+            CREATE INDEX IF NOT EXISTS idx_secrot_session ON sector_rotation(session_id, scan_date);
             ");
+
+            MigrateSchema();
+        }
+
+        /// <summary>
+        /// v4.0 added columns to two pre-existing tables. CREATE TABLE IF NOT EXISTS above only
+        /// covers a brand-new DB — an existing NseMomentumScanner.db from v3.x needs these columns
+        /// added explicitly. SQLite has no "ADD COLUMN IF NOT EXISTS", so each ALTER is attempted
+        /// and a "duplicate column" failure (already migrated) is swallowed; anything else is logged.
+        /// </summary>
+        private void MigrateSchema()
+        {
+            var scanResultsCols = new[]
+            {
+                "rs_raw REAL", "avg_turnover_inr REAL", "is_liquid INTEGER",
+                "extension_pct REAL", "is_extended INTEGER",
+                "atr_value REAL", "suggested_stop REAL", "suggested_target REAL",
+            };
+            var aggregatedCols = new[]
+            {
+                "rs_raw REAL", "rs_rank REAL", "avg_turnover_inr REAL", "is_liquid INTEGER",
+                "extension_pct REAL", "is_extended INTEGER",
+                "atr_value REAL", "suggested_stop REAL", "suggested_target REAL",
+                "gate_reason TEXT",
+                "sector TEXT", "sector_rank REAL",
+                "pe_ratio REAL", "roe_pct REAL", "debt_to_equity REAL", "eps_growth_pct REAL",
+                "promoter_pledge_pct REAL", "next_earnings_date TEXT", "in_earnings_blackout INTEGER",
+            };
+            var sessionCols = new[] { "weight_source TEXT NOT NULL DEFAULT 'default'" };
+
+            foreach (var col in scanResultsCols)
+                TryAlterAddColumn("scan_results", col);
+            foreach (var col in aggregatedCols)
+                TryAlterAddColumn("aggregated_results", col);
+            foreach (var col in sessionCols)
+                TryAlterAddColumn("scan_sessions", col);
+        }
+
+        private void TryAlterAddColumn(string table, string columnDef)
+        {
+            try { Exec($"ALTER TABLE {table} ADD COLUMN {columnDef};"); }
+            catch (SqliteException ex) when (ex.Message.Contains("duplicate column", StringComparison.OrdinalIgnoreCase))
+            {
+                // Already migrated on a prior run — expected, not an error.
+            }
+            catch (Exception ex)
+            {
+                Log.Warning("Schema migration: could not add {Table}.{Col}: {Msg}", table, columnDef, ex.Message);
+            }
         }
 
         private void Exec(string sql)
@@ -1512,14 +2659,17 @@ namespace NseMomentumScanner
                  weekly_high,weekly_low,monthly_high,monthly_low,quarterly_high,quarterly_low,
                  yearly_high,yearly_low,pct_52w_high,pct_52w_low,pct_month_high,pct_week_high,
                  st_bullish,st_days,st_flip_date,st_cal_days,
-                 st_hh,st_hh_ago,st_hl,st_hl_ago,st_lh,st_lh_ago,st_ll,st_ll_ago)
+                 st_hh,st_hh_ago,st_hl,st_hl_ago,st_lh,st_lh_ago,st_ll,st_ll_ago,
+                 rs_raw,avg_turnover_inr,is_liquid,extension_pct,is_extended,
+                 atr_value,suggested_stop,suggested_target)
                 VALUES(@sid,@sym,@dt,@tf,@rk,
                  @ts,@sts,@hms,@ads,@vcs,@vls,@trs,
                  @ib,@is,@lc,@lo,@lh,@ll,@lv,
                  @sv,@bs,@hf,@hs,@ef,@es,
                  @av,@vr,@ax,@pd,@md,@vcp,
                  @wh,@wl,@mh,@ml,@qh,@ql,@yh,@yl,@p2h,@p2l,@pmh,@pwh,
-                 @stb,@std,@stf,@stc,@shh,@sha,@shl,@shla,@slh,@slha,@sll,@slla)";
+                 @stb,@std,@stf,@stc,@shh,@sha,@shl,@shla,@slh,@slha,@sll,@slla,
+                 @rsr,@atv,@liq,@ext,@isx,@atr,@sstop,@starget)";
 
                 using var tx  = _conn.BeginTransaction();
                 using var cmd = new SqliteCommand(sql, _conn, tx);
@@ -1527,7 +2677,8 @@ namespace NseMomentumScanner
                 AddParams(p, "@sid,@sym,@dt,@tf,@rk,@ts,@sts,@hms,@ads,@vcs,@vls,@trs," +
                     "@ib,@is,@lc,@lo,@lh,@ll,@lv,@sv,@bs,@hf,@hs,@ef,@es,@av,@vr,@ax,@pd,@md,@vcp," +
                     "@wh,@wl,@mh,@ml,@qh,@ql,@yh,@yl,@p2h,@p2l,@pmh,@pwh," +
-                    "@stb,@std,@stf,@stc,@shh,@sha,@shl,@shla,@slh,@slha,@sll,@slla");
+                    "@stb,@std,@stf,@stc,@shh,@sha,@shl,@shla,@slh,@slha,@sll,@slla," +
+                    "@rsr,@atv,@liq,@ext,@isx,@atr,@sstop,@starget");
 
                 foreach (var r in rows)
                 {
@@ -1562,6 +2713,11 @@ namespace NseMomentumScanner
                     p["@shl"].Value=(double)M.HighestLow;  p["@shla"].Value=M.HighestLowDaysAgo;
                     p["@slh"].Value=(double)M.LowestHigh;  p["@slha"].Value=M.LowestHighDaysAgo;
                     p["@sll"].Value=(double)M.LowestLow;   p["@slla"].Value=M.LowestLowDaysAgo;
+                    p["@rsr"].Value=r.RsRaw;   p["@atv"].Value=r.AvgTurnoverInr;
+                    p["@liq"].Value=r.IsLiquid?1:0; p["@ext"].Value=r.ExtensionPct;
+                    p["@isx"].Value=r.IsExtended?1:0;
+                    p["@atr"].Value=r.AtrValue; p["@sstop"].Value=r.SuggestedStop;
+                    p["@starget"].Value=r.SuggestedTarget;
                     cmd.ExecuteNonQuery();
                 }
                 tx.Commit();
@@ -1580,16 +2736,24 @@ namespace NseMomentumScanner
                  recommendation,rank,last_close,data_tf,
                  weekly_high,weekly_low,monthly_high,monthly_low,quarterly_high,quarterly_low,
                  yearly_high,yearly_low,pct_52w_high,pct_52w_low,
-                 st_bullish,st_days,st_flip_date,st_cal_days,st_hh,st_hh_ago,st_ll,st_ll_ago)
+                 st_bullish,st_days,st_flip_date,st_cal_days,st_hh,st_hh_ago,st_ll,st_ll_ago,
+                 rs_raw,rs_rank,avg_turnover_inr,is_liquid,extension_pct,is_extended,
+                 atr_value,suggested_stop,suggested_target,gate_reason,
+                 sector,sector_rank,pe_ratio,roe_pct,debt_to_equity,eps_growth_pct,
+                 promoter_pledge_pct,next_earnings_date,in_earnings_blackout)
                 VALUES(@sid,@sym,@dt,@as,@mos,@ws,@ds,@hs,@ms,@fs,@bt,@be,@rec,@rk,@lc,@tf,
                  @wh,@wl,@mh,@ml,@qh,@ql,@yh,@yl,@p2h,@p2l,
-                 @stb,@std,@stf,@stc,@shh,@sha,@sll,@sla)";
+                 @stb,@std,@stf,@stc,@shh,@sha,@sll,@sla,
+                 @rsr,@rrk,@atv,@liq,@ext,@isx,@atr,@sstop,@starget,@gr,
+                 @sec,@secr,@pe,@roe,@de,@eps,@pledge,@nextearn,@blackout)";
 
                 using var tx  = _conn.BeginTransaction();
                 using var cmd = new SqliteCommand(sql, _conn, tx);
                 var p = cmd.Parameters;
                 AddParams(p, "@sid,@sym,@dt,@as,@mos,@ws,@ds,@hs,@ms,@fs,@bt,@be,@rec,@rk,@lc,@tf," +
-                    "@wh,@wl,@mh,@ml,@qh,@ql,@yh,@yl,@p2h,@p2l,@stb,@std,@stf,@stc,@shh,@sha,@sll,@sla");
+                    "@wh,@wl,@mh,@ml,@qh,@ql,@yh,@yl,@p2h,@p2l,@stb,@std,@stf,@stc,@shh,@sha,@sll,@sla," +
+                    "@rsr,@rrk,@atv,@liq,@ext,@isx,@atr,@sstop,@starget,@gr," +
+                    "@sec,@secr,@pe,@roe,@de,@eps,@pledge,@nextearn,@blackout");
 
                 foreach (var a in rows)
                 {
@@ -1614,9 +2778,122 @@ namespace NseMomentumScanner
                     p["@stc"].Value=M.CalendarDaysSinceFlip;
                     p["@shh"].Value=(double)M.HighestHigh; p["@sha"].Value=M.HighestHighDaysAgo;
                     p["@sll"].Value=(double)M.LowestLow;   p["@sla"].Value=M.LowestLowDaysAgo;
+                    p["@rsr"].Value=a.RsRaw;  p["@rrk"].Value=a.RsRank;
+                    p["@atv"].Value=a.AvgTurnoverInr; p["@liq"].Value=a.IsLiquid?1:0;
+                    p["@ext"].Value=a.ExtensionPct;   p["@isx"].Value=a.IsExtended?1:0;
+                    p["@atr"].Value=a.AtrValue; p["@sstop"].Value=a.SuggestedStop;
+                    p["@starget"].Value=a.SuggestedTarget;
+                    p["@gr"].Value=a.GateReason;
+                    p["@sec"].Value=a.Sector; p["@secr"].Value=a.SectorRankPercentile;
+                    p["@pe"].Value=(object?)a.PeRatio ?? DBNull.Value;
+                    p["@roe"].Value=(object?)a.RoePct ?? DBNull.Value;
+                    p["@de"].Value=(object?)a.DebtToEquity ?? DBNull.Value;
+                    p["@eps"].Value=(object?)a.EpsGrowthPct ?? DBNull.Value;
+                    p["@pledge"].Value=(object?)a.PromoterPledgePct ?? DBNull.Value;
+                    p["@nextearn"].Value=a.NextEarningsDate.HasValue
+                        ? a.NextEarningsDate.Value.ToString("yyyy-MM-dd") : (object)DBNull.Value;
+                    p["@blackout"].Value=a.InEarningsBlackout?1:0;
                     cmd.ExecuteNonQuery();
                 }
                 tx.Commit();
+            }
+            finally { _writeLock.Release(); }
+        }
+
+        // ── v4.0: market regime + data-quality persistence ─────────────────────
+        public async Task InsertMarketRegimeAsync(int sid, DateTime scanDate, MarketRegimeInfo regime)
+        {
+            await _writeLock.WaitAsync();
+            try
+            {
+                const string sql = @"INSERT OR REPLACE INTO market_regime
+                (session_id,scan_date,benchmark_symbol,benchmark_close,ema50,ema200,regime,
+                 breadth_total,breadth_bullish,breadth_bearish,breadth_pct_bullish)
+                VALUES(@sid,@dt,@sym,@cl,@e50,@e200,@rg,@bt,@bb,@be,@bp)";
+                using var cmd = new SqliteCommand(sql, _conn);
+                cmd.Parameters.AddWithValue("@sid", sid);
+                cmd.Parameters.AddWithValue("@dt", scanDate.ToString("yyyy-MM-dd"));
+                cmd.Parameters.AddWithValue("@sym", regime.BenchmarkSymbol);
+                cmd.Parameters.AddWithValue("@cl", (double)regime.BenchmarkClose);
+                cmd.Parameters.AddWithValue("@e50", regime.Ema50);
+                cmd.Parameters.AddWithValue("@e200", regime.Ema200);
+                cmd.Parameters.AddWithValue("@rg", regime.Regime);
+                cmd.Parameters.AddWithValue("@bt", regime.BreadthTotal);
+                cmd.Parameters.AddWithValue("@bb", regime.BreadthBullish);
+                cmd.Parameters.AddWithValue("@be", regime.BreadthBearish);
+                cmd.Parameters.AddWithValue("@bp", regime.BreadthPctBullish);
+                await cmd.ExecuteNonQueryAsync();
+            }
+            finally { _writeLock.Release(); }
+        }
+
+        public async Task BulkInsertDataQualityIssuesAsync(
+            int sid, IReadOnlyList<(string Symbol, string Timeframe, string Reason)> issues)
+        {
+            if (issues.Count == 0) return;
+            await _writeLock.WaitAsync();
+            try
+            {
+                const string sql = @"INSERT INTO data_quality_issues(session_id,symbol,timeframe,reason)
+                                      VALUES(@sid,@sym,@tf,@reason)";
+                using var tx  = _conn.BeginTransaction();
+                using var cmd = new SqliteCommand(sql, _conn, tx);
+                cmd.Parameters.Add(new SqliteParameter { ParameterName = "@sid" });
+                cmd.Parameters.Add(new SqliteParameter { ParameterName = "@sym" });
+                cmd.Parameters.Add(new SqliteParameter { ParameterName = "@tf" });
+                cmd.Parameters.Add(new SqliteParameter { ParameterName = "@reason" });
+                foreach (var issue in issues)
+                {
+                    cmd.Parameters["@sid"].Value = sid;
+                    cmd.Parameters["@sym"].Value = issue.Symbol;
+                    cmd.Parameters["@tf"].Value = issue.Timeframe;
+                    cmd.Parameters["@reason"].Value = issue.Reason;
+                    cmd.ExecuteNonQuery();
+                }
+                tx.Commit();
+            }
+            finally { _writeLock.Release(); }
+        }
+
+        // ── v4.1: sector rotation + weight-source audit trail ──────────────────
+        public async Task BulkInsertSectorRotationAsync(
+            int sid, DateTime scanDate, IReadOnlyList<SectorRotationRow> rows)
+        {
+            if (rows.Count == 0) return;
+            await _writeLock.WaitAsync();
+            try
+            {
+                const string sql = @"INSERT OR REPLACE INTO sector_rotation
+                    (session_id,scan_date,sector,stock_count,bullish_count,avg_score,avg_rs_raw,rank_percentile)
+                    VALUES(@sid,@dt,@sec,@cnt,@bull,@avg,@avgrs,@rank)";
+                using var tx  = _conn.BeginTransaction();
+                using var cmd = new SqliteCommand(sql, _conn, tx);
+                var p = cmd.Parameters;
+                AddParams(p, "@sid,@dt,@sec,@cnt,@bull,@avg,@avgrs,@rank");
+                string dt = scanDate.ToString("yyyy-MM-dd");
+                foreach (var row in rows)
+                {
+                    p["@sid"].Value = sid; p["@dt"].Value = dt; p["@sec"].Value = row.Sector;
+                    p["@cnt"].Value = row.StockCount; p["@bull"].Value = row.BullishCount;
+                    p["@avg"].Value = row.AvgScore; p["@avgrs"].Value = row.AvgRsRaw;
+                    p["@rank"].Value = row.RankPercentile;
+                    cmd.ExecuteNonQuery();
+                }
+                tx.Commit();
+            }
+            finally { _writeLock.Release(); }
+        }
+
+        public async Task UpdateSessionWeightSourceAsync(int sid, string weightSource)
+        {
+            await _writeLock.WaitAsync();
+            try
+            {
+                using var cmd = new SqliteCommand(
+                    "UPDATE scan_sessions SET weight_source=@ws WHERE session_id=@sid", _conn);
+                cmd.Parameters.AddWithValue("@ws", weightSource);
+                cmd.Parameters.AddWithValue("@sid", sid);
+                await cmd.ExecuteNonQueryAsync();
             }
             finally { _writeLock.Release(); }
         }
@@ -1809,7 +3086,7 @@ namespace NseMomentumScanner
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.WriteLine(@"
   ╔═══════════════════════════════════════════════════════════════════════╗
-  ║   NSE MOMENTUM SCANNER  ·  Multi-Timeframe  ·  v3.3  ·  .NET 8      ║
+  ║   NSE MOMENTUM SCANNER  ·  Multi-Timeframe  ·  v4.0  ·  .NET 8      ║
   ╚═══════════════════════════════════════════════════════════════════════╝");
             Console.ResetColor();
             PrintLine('─');
@@ -2000,9 +3277,25 @@ namespace NseMomentumScanner
             var scoreStart = today.AddDays(-Config.ScanHistoryDays);
             var scoreEnd   = today;
 
+            // ── v4.0: fetch the market benchmark ONCE (not per ticker) and classify the
+            // regime before scoring the universe — RS needs the benchmark's own close series,
+            // and the aggregator needs the regime to gate BUY generation. A benchmark fetch
+            // failure degrades to NEUTRAL (no gating) rather than blocking the whole scan.
+            Log.Information("Fetching market benchmark {Sym} for regime + relative strength…",
+                Config.MarketBenchmarkSymbol);
+            var (marketRegime, benchmarkCloseByDate) =
+                await MarketRegimeAnalyzer.BuildAsync(_fetcher, today, ct);
+            Log.Information("Market regime: {Regime} (benchmark {Close:F1}, EMA50={E50:F1}, EMA200={E200:F1})",
+                marketRegime.Regime, marketRegime.BenchmarkClose, marketRegime.Ema50, marketRegime.Ema200);
+
+            // ── v4.1: load sector/fundamentals/earnings reference data once per scan ─────────
+            // Safe no-op if the file doesn't exist — see ReferenceDataProvider's header comment.
+            ReferenceDataProvider.Load(Config.ReferenceDataCsvPath);
+
             // All last-day results kept for aggregation; full history streamed to DB
             var lastDayResults = new ConcurrentBag<ScanResult>();
             var allForCsv      = new ConcurrentBag<ScanResult>(); // for per-date CSV
+            var skipReasons    = new ConcurrentBag<(string Symbol, string Timeframe, string Reason)>();
 
             ConsoleReporter.InitProgress(total);
 
@@ -2029,14 +3322,19 @@ namespace NseMomentumScanner
                             if (!dq.IsValid)
                             {
                                 Log.Debug("Skip {Sym} {TF}: {Reason}", symbol, tfLabel, dq.FailReason);
+                                skipReasons.Add((symbol, tfLabel, dq.FailReason));
                                 continue;
                             }
 
                             var tfResults = TickerScorer.Score(
                                 symbol, interval, tfLabel, vcpEnabled,
-                                quotes, scoreStart, scoreEnd);
+                                quotes, scoreStart, scoreEnd, benchmarkCloseByDate);
 
-                            if (tfResults.Count == 0) continue;
+                            if (tfResults.Count == 0)
+                            {
+                                skipReasons.Add((symbol, tfLabel, "No bars cleared the warmup/minimum-bars threshold"));
+                                continue;
+                            }
 
                             // All results → CSV accumulator
                             foreach (var r in tfResults) allForCsv.Add(r);
@@ -2054,6 +3352,7 @@ namespace NseMomentumScanner
                             // transient bad data) to this ticker+timeframe. Never let a single symbol
                             // take down the whole Parallel.ForEachAsync batch.
                             Log.Warning("Scoring error {Sym} [{TF}]: {Msg}", symbol, tfLabel, ex.Message);
+                            skipReasons.Add((symbol, tfLabel, $"Error: {ex.Message}"));
                         }
                     }
 
@@ -2095,9 +3394,11 @@ namespace NseMomentumScanner
             }
 
             // ── Aggregate last day ────────────────────────────────────────────
+            // marketRegime is a class (reference type) — Aggregate fills in its Breadth*
+            // fields from the universe's own daily results before we persist it below.
             var lastDay     = allDates.Count > 0 ? allDates[^1] : today;
             var allLastDay  = lastDayResults.ToList();
-            var aggResults  = MultiTfAggregator.Aggregate(allLastDay, lastDay);
+            var aggResults  = MultiTfAggregator.Aggregate(allLastDay, lastDay, marketRegime);
 
             if (aggResults.Count > 0)
             {
@@ -2106,11 +3407,39 @@ namespace NseMomentumScanner
                 CsvExporter.WriteAggregated(aggResults, lastDay);
             }
 
+            // ── v4.0: persist market regime + data-quality summary ─────────────
+            try { await _db.InsertMarketRegimeAsync(sessionId, lastDay, marketRegime); }
+            catch (Exception ex) { Log.Warning("DB regime insert error: {Msg}", ex.Message); }
+
+            try { await _db.BulkInsertDataQualityIssuesAsync(sessionId, skipReasons.ToList()); }
+            catch (Exception ex) { Log.Warning("DB data-quality insert error: {Msg}", ex.Message); }
+
+            // ── v4.1: sector rotation summary ───────────────────────────────────
+            var sectorRotation = MultiTfAggregator.BuildSectorRotationSummary(aggResults);
+            try { await _db.BulkInsertSectorRotationAsync(sessionId, lastDay, sectorRotation); }
+            catch (Exception ex) { Log.Warning("DB sector-rotation insert error: {Msg}", ex.Message); }
+
+            // ── v4.1: record which weight-set produced this session, for audit/dashboard ────
+            string weightSetSource = Config.ActiveOptimizedWeights is { } ow
+                ? $"optimized:{ow.GeneratedAtUtc:yyyy-MM-dd}:{ow.Objective}"
+                : "default";
+            try { await _db.UpdateSessionWeightSourceAsync(sessionId, weightSetSource); }
+            catch (Exception ex) { Log.Warning("DB weight-source update error: {Msg}", ex.Message); }
+
             // ── Prune old sessions ────────────────────────────────────────────
             _db.PruneOldSessions();
 
             // ── Console output — last day only ────────────────────────────────
             Console.WriteLine();
+            Console.WriteLine($"  Market regime: {marketRegime.Regime}  |  Breadth: " +
+                $"{marketRegime.BreadthBullish}/{marketRegime.BreadthTotal} bullish " +
+                $"({marketRegime.BreadthPctBullish:F1}%)  |  Weights: {weightSetSource}");
+            if (sectorRotation.Count > 0)
+            {
+                var topSectors = sectorRotation.Take(3)
+                    .Select(s => $"{s.Sector} ({s.AvgScore:+0.0;-0.0;0.0})");
+                Console.WriteLine($"  Leading sectors today: {string.Join(", ", topSectors)}");
+            }
             Console.WriteLine($"  Timeframe breakdown for {lastDay:yyyy-MM-dd}:");
             ConsoleReporter.PrintLine('─');
             foreach (var (_, tfLabel, _, _, _) in Config.ScanTimeframes)
@@ -2150,7 +3479,7 @@ namespace NseMomentumScanner
     // =========================================================================
     internal static class DashboardDataBuilder
     {
-        private sealed record SessionRow(string RunTimestamp, string Universe, int Total, int Scored);
+        private sealed record SessionRow(string RunTimestamp, string Universe, int Total, int Scored, string WeightSource);
 
         private sealed record AggRow(
             string Symbol, string? Rec, int? Rank, double? Close, double? AggScore,
@@ -2159,7 +3488,11 @@ namespace NseMomentumScanner
             double? YH, double? YL, double? QH, double? QL, double? MH, double? ML,
             double? WH, double? WL, double? P52H, double? P52L,
             bool StBull, int? StDays, string? StFlip, int? StCalDays,
-            double? StHH, int? StHHAgo, double? StLL, int? StLLAgo);
+            double? StHH, int? StHHAgo, double? StLL, int? StLLAgo,
+            double? RsRank, double? AvgTurnover, bool IsLiquid, double? ExtPct, bool IsExtended,
+            double? Atr, double? SuggStop, double? SuggTarget, string? GateReason,
+            string? Sector, double? SectorRank, double? Pe, double? Roe, double? DebtEquity,
+            double? EpsGrowth, double? Pledge, string? NextEarnings, bool InEarningsBlackout);
 
         private sealed record DailyDetail(
             double? Adx, double? Pdi, double? Mdi, double? VolR, double? AvgVol, bool Vcp,
@@ -2202,6 +3535,14 @@ namespace NseMomentumScanner
                 ? new List<(string tf, int total, int bulls, int bears, double avg)>()
                 : await ReadTfBreakdownAsync(conn, sid, scanDate, ct);
 
+            // v4.0: market regime snapshot + a rollup of why tickers were skipped this session
+            var regime      = scanDate == null ? null : await ReadMarketRegimeAsync(conn, sid, scanDate, ct);
+            var dataQuality = await ReadDataQualitySummaryAsync(conn, sid, ct);
+            // v4.1: sector rotation summary
+            var sectorRotation = scanDate == null
+                ? new List<(string Sector, int Count, int Bullish, double AvgScore, double AvgRs, double Rank)>()
+                : await ReadSectorRotationAsync(conn, sid, scanDate, ct);
+
             var stocks = new JsonArray();
             foreach (var r in aggRows)
             {
@@ -2218,23 +3559,91 @@ namespace NseMomentumScanner
                     ["bears"] = t.bears, ["avg"] = Math.Round(t.avg, 1),
                 });
 
+            var sectorOut = new JsonArray();
+            foreach (var s in sectorRotation)
+                sectorOut.Add(new JsonObject
+                {
+                    ["sector"] = s.Sector, ["count"] = s.Count, ["bullish"] = s.Bullish,
+                    ["avgScore"] = s.AvgScore, ["avgRs"] = s.AvgRs, ["rank"] = s.Rank,
+                });
+
             var root = new JsonObject
             {
                 ["generated"] = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"),
                 ["scanDate"]  = scanDate,
                 ["session"]   = new JsonObject
                 {
-                    ["id"]       = sid,
-                    ["runDate"]  = session.RunTimestamp.Length >= 10 ? session.RunTimestamp[..10] : session.RunTimestamp,
-                    ["total"]    = session.Total,
-                    ["scored"]   = session.Scored,
-                    ["universe"] = session.Universe,
+                    ["id"]           = sid,
+                    ["runDate"]      = session.RunTimestamp.Length >= 10 ? session.RunTimestamp[..10] : session.RunTimestamp,
+                    ["total"]        = session.Total,
+                    ["scored"]       = session.Scored,
+                    ["universe"]     = session.Universe,
+                    ["weightSource"] = session.WeightSource, // v4.1: "default" or "optimized:YYYY-MM-DD:objective"
                 },
                 ["stocks"]      = stocks,
                 ["tfBreakdown"] = tfOut,
+                ["sectorRotation"] = sectorOut,
+                ["marketRegime"] = regime == null ? null : new JsonObject
+                {
+                    ["benchmark"]       = regime.Value.Symbol,
+                    ["close"]           = regime.Value.Close,
+                    ["ema50"]           = regime.Value.Ema50,
+                    ["ema200"]          = regime.Value.Ema200,
+                    ["regime"]          = regime.Value.Regime,
+                    ["breadthTotal"]    = regime.Value.BreadthTotal,
+                    ["breadthBullish"]  = regime.Value.BreadthBullish,
+                    ["breadthBearish"]  = regime.Value.BreadthBearish,
+                    ["breadthPctBullish"] = regime.Value.BreadthPctBullish,
+                },
+                ["dataQuality"] = BuildDataQualityJson(dataQuality),
             };
 
             return root.ToJsonString(new JsonSerializerOptions { WriteIndented = false });
+        }
+
+        private static async Task<List<(string Sector, int Count, int Bullish, double AvgScore, double AvgRs, double Rank)>>
+            ReadSectorRotationAsync(SqliteConnection c, int sid, string scanDate, CancellationToken ct)
+        {
+            const string sql = @"
+                SELECT sector, stock_count, bullish_count, avg_score, avg_rs_raw, rank_percentile
+                FROM sector_rotation WHERE session_id=@sid AND scan_date=@dt
+                ORDER BY rank_percentile DESC";
+            await using var cmd = new SqliteCommand(sql, c);
+            cmd.Parameters.AddWithValue("@sid", sid);
+            cmd.Parameters.AddWithValue("@dt", scanDate);
+            await using var rd = await cmd.ExecuteReaderAsync(ct);
+            var list = new List<(string, int, int, double, double, double)>();
+            while (await rd.ReadAsync(ct))
+                list.Add((rd.GetString(0), GetI(rd, 1) ?? 0, GetI(rd, 2) ?? 0,
+                    GetD(rd, 3) ?? 0, GetD(rd, 4) ?? 0, GetD(rd, 5) ?? 50));
+            return list;
+        }
+
+        private static JsonObject BuildDataQualityJson(List<(string Symbol, string Timeframe, string Reason)> issues)
+        {
+            var byReason = new JsonArray();
+            foreach (var g in issues.GroupBy(x => SummarizeReason(x.Reason)).OrderByDescending(g => g.Count()).Take(8))
+                byReason.Add(new JsonObject { ["reason"] = g.Key, ["count"] = g.Count() });
+
+            return new JsonObject
+            {
+                ["totalIssues"] = issues.Count,
+                ["byReason"] = byReason,
+            };
+        }
+
+        /// <summary>Collapses free-text skip reasons (which embed specific numbers/dates) into a
+        /// small set of stable buckets so the dashboard shows "Stale data (x12)" instead of 12
+        /// near-identical strings that each only ever occur once.</summary>
+        private static string SummarizeReason(string reason)
+        {
+            if (reason.StartsWith("Only", StringComparison.OrdinalIgnoreCase)) return "Too few bars";
+            if (reason.StartsWith("Stale", StringComparison.OrdinalIgnoreCase)) return "Stale data";
+            if (reason.Contains("zero-volume", StringComparison.OrdinalIgnoreCase)) return "Too many zero-volume bars";
+            if (reason.StartsWith("OHLC", StringComparison.OrdinalIgnoreCase)) return "OHLC integrity failure";
+            if (reason.StartsWith("No bars cleared", StringComparison.OrdinalIgnoreCase)) return "Insufficient warmup history";
+            if (reason.StartsWith("Error:", StringComparison.OrdinalIgnoreCase)) return "Fetch/scoring error";
+            return "Other";
         }
 
         private static JsonObject BuildStockJson(AggRow r, DailyDetail? d, List<(string date, double score)>? hist)
@@ -2258,7 +3667,8 @@ namespace NseMomentumScanner
                 ["moSc"] = r.MoSc,
                 ["bullTf"]   = r.BullTf ?? 0,
                 ["bearTf"]   = r.BearTf ?? 0,
-                ["sector"]   = "—", // not captured by the scanner — left as a placeholder, not fabricated
+                ["sector"]   = r.Sector ?? "Unclassified",           // v4.1: real sector (CSV override > built-in map)
+                ["sectorRank"] = r.SectorRank ?? 50,                  // v4.1: sector-rotation percentile
                 ["levels"] = new JsonObject
                 {
                     ["yH"] = r.YH, ["yL"] = r.YL, ["qH"] = r.QH, ["qL"] = r.QL,
@@ -2287,6 +3697,28 @@ namespace NseMomentumScanner
                     ["st"] = d?.ScSt, ["hma"] = d?.ScHma, ["adx"] = d?.ScAdx,
                     ["vcp"] = d?.ScVcp, ["vol"] = d?.ScVol, ["tr"] = d?.ScTr,
                 },
+                // ── v4.0: relative strength, liquidity, extension, risk levels ─────────
+                ["rsRank"]        = r.RsRank,
+                ["avgTurnover"]   = r.AvgTurnover,
+                ["isLiquid"]      = r.IsLiquid,
+                ["extensionPct"]  = r.ExtPct,
+                ["isExtended"]    = r.IsExtended,
+                ["atr"]           = r.Atr,
+                ["suggestedStop"]   = r.SuggStop,
+                ["suggestedTarget"] = r.SuggTarget,
+                ["gateReason"]      = r.GateReason,
+                // ── v4.1: fundamentals + earnings blackout (from data/reference.csv, if present) ──
+                ["fundamentals"] = new JsonObject
+                {
+                    ["pe"]              = r.Pe,
+                    ["roePct"]          = r.Roe,
+                    ["debtToEquity"]    = r.DebtEquity,
+                    ["epsGrowthPct"]    = r.EpsGrowth,
+                    ["promoterPledgePct"] = r.Pledge,
+                    ["hasData"]         = r.Pe != null || r.Roe != null || r.DebtEquity != null || r.EpsGrowth != null,
+                },
+                ["nextEarningsDate"]    = r.NextEarnings,
+                ["inEarningsBlackout"]  = r.InEarningsBlackout,
                 ["history"] = histArr,
             };
         }
@@ -2311,12 +3743,13 @@ namespace NseMomentumScanner
         private static async Task<SessionRow?> ReadSessionAsync(SqliteConnection c, int sid, CancellationToken ct)
         {
             await using var cmd = new SqliteCommand(
-                "SELECT run_timestamp, universe, total_tickers, scored_tickers " +
+                "SELECT run_timestamp, universe, total_tickers, scored_tickers, weight_source " +
                 "FROM scan_sessions WHERE session_id=@sid", c);
             cmd.Parameters.AddWithValue("@sid", sid);
             await using var rd = await cmd.ExecuteReaderAsync(ct);
             if (!await rd.ReadAsync(ct)) return null;
-            return new SessionRow(rd.GetString(0), rd.GetString(1), rd.GetInt32(2), rd.GetInt32(3));
+            return new SessionRow(rd.GetString(0), rd.GetString(1), rd.GetInt32(2), rd.GetInt32(3),
+                rd.IsDBNull(4) ? "default" : rd.GetString(4));
         }
 
         private static double? GetD(SqliteDataReader rd, int i) => rd.IsDBNull(i) ? null : rd.GetDouble(i);
@@ -2332,7 +3765,11 @@ namespace NseMomentumScanner
                        yearly_high, yearly_low, quarterly_high, quarterly_low,
                        monthly_high, monthly_low, weekly_high, weekly_low,
                        pct_52w_high, pct_52w_low,
-                       st_bullish, st_days, st_flip_date, st_cal_days, st_hh, st_hh_ago, st_ll, st_ll_ago
+                       st_bullish, st_days, st_flip_date, st_cal_days, st_hh, st_hh_ago, st_ll, st_ll_ago,
+                       rs_rank, avg_turnover_inr, is_liquid, extension_pct, is_extended,
+                       atr_value, suggested_stop, suggested_target, gate_reason,
+                       sector, sector_rank, pe_ratio, roe_pct, debt_to_equity, eps_growth_pct,
+                       promoter_pledge_pct, next_earnings_date, in_earnings_blackout
                 FROM aggregated_results
                 WHERE session_id=@sid AND scan_date=@dt
                 ORDER BY aggregate_score DESC";
@@ -2351,7 +3788,12 @@ namespace NseMomentumScanner
                     GetD(rd, 17), GetD(rd, 18), GetD(rd, 19), GetD(rd, 20),
                     GetD(rd, 21), GetD(rd, 22),
                     !rd.IsDBNull(23) && rd.GetInt32(23) != 0, GetI(rd, 24), GetS(rd, 25), GetI(rd, 26),
-                    GetD(rd, 27), GetI(rd, 28), GetD(rd, 29), GetI(rd, 30)));
+                    GetD(rd, 27), GetI(rd, 28), GetD(rd, 29), GetI(rd, 30),
+                    GetD(rd, 31), GetD(rd, 32), rd.IsDBNull(33) || rd.GetInt32(33) != 0, GetD(rd, 34),
+                    !rd.IsDBNull(35) && rd.GetInt32(35) != 0,
+                    GetD(rd, 36), GetD(rd, 37), GetD(rd, 38), GetS(rd, 39),
+                    GetS(rd, 40), GetD(rd, 41), GetD(rd, 42), GetD(rd, 43), GetD(rd, 44), GetD(rd, 45),
+                    GetD(rd, 46), GetS(rd, 47), !rd.IsDBNull(48) && rd.GetInt32(48) != 0));
             }
             return list;
         }
@@ -2407,6 +3849,36 @@ namespace NseMomentumScanner
                 lst.Add((rd.GetString(1), rd.IsDBNull(2) ? 0 : rd.GetDouble(2)));
             }
             return result;
+        }
+
+        private static async Task<(string Symbol, double? Close, double? Ema50, double? Ema200,
+            string Regime, int BreadthTotal, int BreadthBullish, int BreadthBearish, double BreadthPctBullish)?>
+            ReadMarketRegimeAsync(SqliteConnection c, int sid, string scanDate, CancellationToken ct)
+        {
+            const string sql = @"
+                SELECT benchmark_symbol, benchmark_close, ema50, ema200, regime,
+                       breadth_total, breadth_bullish, breadth_bearish, breadth_pct_bullish
+                FROM market_regime WHERE session_id=@sid AND scan_date=@dt";
+            await using var cmd = new SqliteCommand(sql, c);
+            cmd.Parameters.AddWithValue("@sid", sid);
+            cmd.Parameters.AddWithValue("@dt", scanDate);
+            await using var rd = await cmd.ExecuteReaderAsync(ct);
+            if (!await rd.ReadAsync(ct)) return null;
+            return (rd.GetString(0), GetD(rd, 1), GetD(rd, 2), GetD(rd, 3), rd.IsDBNull(4) ? "NEUTRAL" : rd.GetString(4),
+                    GetI(rd, 5) ?? 0, GetI(rd, 6) ?? 0, GetI(rd, 7) ?? 0, GetD(rd, 8) ?? 0);
+        }
+
+        private static async Task<List<(string Symbol, string Timeframe, string Reason)>> ReadDataQualitySummaryAsync(
+            SqliteConnection c, int sid, CancellationToken ct)
+        {
+            const string sql = "SELECT symbol, timeframe, reason FROM data_quality_issues WHERE session_id=@sid";
+            await using var cmd = new SqliteCommand(sql, c);
+            cmd.Parameters.AddWithValue("@sid", sid);
+            await using var rd = await cmd.ExecuteReaderAsync(ct);
+            var list = new List<(string, string, string)>();
+            while (await rd.ReadAsync(ct))
+                list.Add((rd.GetString(0), rd.GetString(1), rd.GetString(2)));
+            return list;
         }
 
         private static async Task<List<(string tf, int total, int bulls, int bears, double avg)>> ReadTfBreakdownAsync(
@@ -2559,12 +4031,50 @@ namespace NseMomentumScanner
                 });
             });
 
+            // ── Backtesting dashboard (new — additive only, never touches the routes above) ──
+            var backtestHtmlPath = Path.Combine(Directory.GetCurrentDirectory(), "nse_backtest_dashboard.html");
+            app.MapGet("/backtest", async (HttpContext http) =>
+            {
+                if (!File.Exists(backtestHtmlPath))
+                    return Results.Text(
+                        "nse_backtest_dashboard.html not found next to the running app.",
+                        "text/plain", statusCode: 404);
+
+                var html = await File.ReadAllTextAsync(backtestHtmlPath, http.RequestAborted);
+                http.Response.Headers.CacheControl = "no-store";
+                return Results.Text(html, "text/html");
+            });
+
+            app.MapGet("/backtest_data.json", async (HttpContext http) =>
+            {
+                try
+                {
+                    http.Response.Headers.CacheControl = "no-store";
+                    if (http.Request.Query.TryGetValue("run", out var rv) && int.TryParse(rv, out var runId))
+                    {
+                        var detail = await BacktestDashboardData.BuildRunDetailJsonAsync(runId);
+                        return detail is null
+                            ? Results.Problem($"Backtest run #{runId} not found.", statusCode: 404)
+                            : Results.Text(detail, "application/json");
+                    }
+                    var list = await BacktestDashboardData.BuildRunsListJsonAsync();
+                    return Results.Text(list, "application/json");
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning("Backtest dashboard API error: {Msg}", ex.Message);
+                    return Results.Problem(ex.Message, statusCode: 503);
+                }
+            });
+
             Log.Information("Dashboard live at   http://{Host}:{Port}/", host, port);
             Log.Information("Live JSON API at    http://{Host}:{Port}/dashboard_data.json", host, port);
             Log.Information("Health check at     http://{Host}:{Port}/api/health", host, port);
+            Log.Information("Backtesting page at http://{Host}:{Port}/backtest", host, port);
             Log.Information("Press Ctrl+C to stop.");
-
-            await app.RunAsync(ct);
+            var url = string.Format("http://{0}:{1}/", host, port);
+            Log.Information("URL: " + url);
+            await app.RunAsync(url);
         }
     }
 
@@ -2604,7 +4114,7 @@ namespace NseMomentumScanner
             if (args.Contains("--help") || args.Contains("-h"))
             {
                 Console.WriteLine(@"
-NSE Momentum Scanner v3.3
+NSE Momentum Scanner v4.0
 
 USAGE
   NseMomentumScanner [options]
@@ -2618,6 +4128,29 @@ OPTIONS
   --port=N           Port for --serve (default: appsettings DashboardPort or 5080)
   --host=NAME        Bind host for --serve (default: appsettings DashboardHost
                       or 'localhost'; use 0.0.0.0 to allow LAN access)
+  --backtest         Run a historical backtest of the scanner's own buy/sell
+                      signals (equivalent to --mode=backtest). Configure via
+                      the ""Backtest"" section of appsettings.json.
+  --mode=backtest    Same as --backtest.
+  --optimize-weights Run a backtest-driven random search over the 6 scoring
+                      weights (VCP/Volume/Trend/Supertrend/HMA/ADX) and write
+                      the best-performing set to optimized_weights.json. The
+                      live scanner (and --serve, --backtest) picks this up
+                      automatically next run if UseOptimizedWeights is true
+                      (default) and the file isn't stale. Uses the same
+                      ""Backtest"" appsettings.json section (universe/date
+                      range/costs) as --backtest.
+    --iterations=N      Candidates to try, plus 1 baseline run (default: 30)
+    --objective=X       sharpe | cagr | calmar (default: sharpe)
+    --max-drawdown=N    Disqualify candidates with worse than N% max
+                         drawdown (default: 35)
+    --min-trades=N      Disqualify candidates with fewer than N trades —
+                         guards against a high score from a tiny, lucky
+                         sample (default: 15)
+    --seed=N            Random seed, for a reproducible search
+    --output=PATH       Where to write the winning weights
+                         (default: OptimizedWeightsPath in appsettings.json,
+                         or optimized_weights.json)
 
 CONFIGURATION
   Create appsettings.json in the working directory to override defaults.
@@ -2635,8 +4168,14 @@ CONFIGURATION
     ""DashboardHost"":       ""localhost"",
     ""CacheEnabled"":        true,
     ""CacheBaseDir"":        "".cache/yahoo"",
-    ""SlowTfCacheHours"":    6
+    ""SlowTfCacheHours"":    6,
+    ""MarketBenchmarkSymbol"": ""^NSEI"",
+    ""ReferenceDataCsvPath"":  ""data/reference.csv"",
+    ""UseOptimizedWeights"":   true
   }
+  See README.md for the full v4.0/v4.1 settings reference (market regime,
+  relative strength, liquidity/extension gates, sector rotation, fundamental
+  screen, earnings blackout, and the weight-optimizer feedback loop).
 ");
                 return;
             }
@@ -2661,6 +4200,13 @@ CONFIGURATION
                 return;
             }
 
+            // ── v4.1: apply a backtest-optimized weight set if one exists and is fresh ──────
+            // Placed after --help/--dry-run (which don't need it) but before every mode that
+            // actually scores stocks — scan, --serve (dashboard reads DB rows scored under
+            // whichever weights were active), and --backtest (an ad-hoc backtest should reflect
+            // what the live scanner would actually do right now, optimized weights included).
+            Config.TryLoadOptimizedWeightsFromDisk();
+
             // ── Serve the live dashboard (no scan) ──────────────────────────────
             if (args.Contains("--serve"))
             {
@@ -2680,6 +4226,76 @@ CONFIGURATION
                 catch (Exception ex)
                 {
                     Log.Fatal(ex, "Dashboard server failed to start");
+                    Environment.Exit(1);
+                }
+                finally
+                {
+                    await Log.CloseAndFlushAsync();
+                }
+                return;
+            }
+
+            // ── Backtest mode (new — historical simulation of the scanner's own signals) ──
+            if (args.Contains("--backtest") ||
+                string.Equals(GetArgValue(args, "--mode"), "backtest", StringComparison.OrdinalIgnoreCase))
+            {
+                using var cts = new CancellationTokenSource();
+                Console.CancelKeyPress += (_, e) =>
+                {
+                    e.Cancel = true;
+                    cts.Cancel();
+                    Log.Warning("Backtest cancelled by user (Ctrl+C).");
+                };
+                try
+                {
+                    await BacktestRunner.RunAsync(cts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    Log.Warning("Backtest cancelled.");
+                }
+                catch (Exception ex)
+                {
+                    Log.Fatal(ex, "Backtest failed");
+                    Environment.Exit(1);
+                }
+                finally
+                {
+                    await Log.CloseAndFlushAsync();
+                }
+                return;
+            }
+
+            // ── Weight optimizer mode (v4.1 — backtest-driven search over scoring weights) ──
+            if (args.Contains("--optimize-weights"))
+            {
+                using var cts = new CancellationTokenSource();
+                Console.CancelKeyPress += (_, e) =>
+                {
+                    e.Cancel = true;
+                    cts.Cancel();
+                    Log.Warning("Weight optimizer cancelled by user (Ctrl+C).");
+                };
+
+                int iterations = int.TryParse(GetArgValue(args, "--iterations"), out var itv) ? itv : 30;
+                string objective = GetArgValue(args, "--objective") ?? "sharpe";
+                double maxDrawdown = double.TryParse(GetArgValue(args, "--max-drawdown"), out var mdv) ? mdv : 35.0;
+                int minTrades = int.TryParse(GetArgValue(args, "--min-trades"), out var mtv) ? mtv : 15;
+                int? seed = int.TryParse(GetArgValue(args, "--seed"), out var sv) ? sv : null;
+                string outputPath = GetArgValue(args, "--output") ?? Config.OptimizedWeightsPath;
+
+                try
+                {
+                    await NseMomentumScanner.Backtesting.WeightOptimizer.RunAsync(
+                        iterations, objective, maxDrawdown, minTrades, seed, outputPath, cts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    Log.Warning("Weight optimizer cancelled.");
+                }
+                catch (Exception ex)
+                {
+                    Log.Fatal(ex, "Weight optimizer failed");
                     Environment.Exit(1);
                 }
                 finally
