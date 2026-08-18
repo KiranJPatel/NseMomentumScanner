@@ -59,6 +59,14 @@ a{color:var(--blue);text-decoration:none}
 .tab-count{background:var(--bg4);color:var(--text2);padding:1px 6px;border-radius:10px;font-size:10px}
 .panel{display:none}.panel.active{display:block}
 
+/* ── Sub-tab pills (within a panel — e.g. Shockers period, Streaks daily/weekly) ── */
+.subtabs{display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap}
+.subtab{padding:5px 12px;border-radius:16px;cursor:pointer;font-size:11px;font-weight:600;
+        color:var(--text3);background:var(--bg1);border:1px solid var(--border);transition:all .15s}
+.subtab:hover{color:var(--text1);border-color:var(--border2)}
+.subtab.active{background:var(--blue2);color:var(--blue);border-color:var(--blue)}
+.grid-2{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:16px}
+
 /* ── Tables ── */
 .tbl-wrap{background:var(--bg1);border:1px solid var(--border);border-radius:var(--r);overflow:hidden}
 .tbl-head{padding:12px 16px;display:flex;align-items:center;justify-content:space-between;
@@ -223,6 +231,8 @@ tr:hover td{background:var(--bg2);cursor:pointer}
   <div id="panel-matrix"    class="panel"></div>
   <div id="panel-levels"    class="panel"></div>
   <div id="panel-supertrend"class="panel"></div>
+  <div id="panel-shockers" class="panel"></div>
+  <div id="panel-streaks"  class="panel"></div>
 </div>
 
 <!-- ─── Stock Detail Modal ──────────────────────────────────────── -->
@@ -414,6 +424,47 @@ let DATA_QUALITY = { totalIssues: 14, byReason: [
 let SECTOR_ROTATION = null; // null => fall back to client-side grouping from STOCKS (see renderDashboard)
 let WEIGHT_SOURCE = 'default';
 
+// v4.2: demo price/volume shockers (1D/3D/1W/1M) + consecutive gainers/losers (overwritten by
+// applyLiveData when live). Built from the same seeded STOCKS array + deterministic srnd/sr
+// generator as everything else here, so demo mode looks plausible and clicking a row opens
+// a real modal (the symbol already exists in STOCKS).
+function mkDemoShockers(){
+  const periodDefs=[['1D',1],['3D',1.8],['1W',3.2],['1M',6.5]]; // rough vol scaling per horizon
+  const periods={};
+  periodDefs.forEach(([label,scale])=>{
+    const rows=STOCKS.map(s=>({
+      sym: s.sym, close: s.close,
+      pctChange: srnd(-scale*9, scale*9, 2),
+      volR: srnd(0.4, 4.2, 2),
+      avgTurnover: s.avgTurnover || (s.avgVol||0)*s.close,
+    }));
+    periods[label] = {
+      gainers: [...rows].filter(r=>r.pctChange>=0).sort((a,b)=>b.pctChange-a.pctChange).slice(0,15),
+      losers:  [...rows].filter(r=>r.pctChange<0).sort((a,b)=>a.pctChange-b.pctChange).slice(0,15),
+      volume:  [...rows].sort((a,b)=>b.volR-a.volR).slice(0,15),
+    };
+  });
+  const mkStreak=(dir,minLen)=>{
+    const picks=[...STOCKS].sort(()=>sr()-0.5).slice(0,6);
+    return picks.map(s=>({
+      sym: s.sym, len: minLen + Math.floor(sr()*4), dir,
+      start: SCAN_DATE, end: SCAN_DATE,
+      cumPct: (dir==='UP'?1:-1)*srnd(2,18,1),
+      close: s.close,
+    })).sort((a,b)=>b.len-a.len);
+  };
+  return {
+    periods,
+    consecutive: {
+      daily:  { gainers: mkStreak('UP',3),  losers: mkStreak('DOWN',3),  minStreak: 3 },
+      weekly: { gainers: mkStreak('UP',2),  losers: mkStreak('DOWN',2),  minStreak: 2 },
+    },
+  };
+}
+let SHOCKERS = mkDemoShockers();
+let SHOCKER_PERIOD = '1D';  // persists across re-renders so a 30s auto-refresh doesn't reset the tab
+let STREAK_KIND = 'daily';
+
 // ═══════════════════════════════════════════════════════════════
 //  UTILITY HELPERS
 // ═══════════════════════════════════════════════════════════════
@@ -529,6 +580,8 @@ function renderTabs(){
     {id:'matrix',icon:'ti-grid-dots',label:'Score Matrix'},
     {id:'levels',icon:'ti-stairs-up',label:'Price Levels'},
     {id:'supertrend',icon:'ti-wave-sine',label:'Supertrend'},
+    {id:'shockers',icon:'ti-bolt',label:'Shockers'},
+    {id:'streaks',icon:'ti-repeat',label:'Streaks'},
   ];
   document.getElementById('tabs').innerHTML=defs.map(d=>`
     <div class="tab ${d.id==='dashboard'?'active':''}" data-panel="${d.id}">
@@ -1222,6 +1275,104 @@ document.addEventListener('keydown',e=>e.key==='Escape'&&closeModal());
 const REFRESH_INTERVAL_MS = 30000;
 let liveConnected = false;
 
+// ─── Shockers Panel (v4.2) ─────────────────────────────────────
+function renderShockers(){
+  const panel=document.getElementById('panel-shockers');
+  const periodLabels=['1D','3D','1W','1M'];
+  const periodNames={'1D':'1 Day','3D':'3 Days','1W':'1 Week','1M':'1 Month'};
+  if(!periodLabels.includes(SHOCKER_PERIOD)) SHOCKER_PERIOD='1D';
+  const data=(SHOCKERS.periods && SHOCKERS.periods[SHOCKER_PERIOD]) || {gainers:[],losers:[],volume:[]};
+
+  const rowHtml=r=>`
+    <tr onclick="openModal('${esc(r.sym)}')">
+      <td>${esc(r.sym.replace('.NS',''))}</td>
+      <td>₹${fNum(r.close)}</td>
+      <td style="color:${r.pctChange>=0?'var(--green)':'var(--red)'};font-weight:600">${fPct(r.pctChange)}</td>
+      <td>${fNum(r.volR,2)}×</td>
+    </tr>`;
+
+  const table=(title,color,icon,rows,emptyMsg)=>`
+    <div class="tbl-wrap">
+      <div class="tbl-head">
+        <span class="tbl-title"><span style="color:${color}"><i class="ti ${icon}"></i> ${title}</span></span>
+        <span style="font-size:11px;color:var(--text3)">${rows.length} stocks</span>
+      </div>
+      <div style="overflow-x:auto"><table>
+        <thead><tr><th>Symbol</th><th>Close</th><th>% Chg</th><th>Vol Ratio</th></tr></thead>
+        <tbody>${rows.length ? rows.map(rowHtml).join('') :
+          `<tr><td colspan="4" style="text-align:center;color:var(--text3);padding:20px">${emptyMsg}</td></tr>`}</tbody>
+      </table></div>
+    </div>`;
+
+  panel.innerHTML=`
+    <div class="subtabs" id="shocker-subtabs">
+      ${periodLabels.map(p=>`<div class="subtab ${p===SHOCKER_PERIOD?'active':''}" data-period="${p}">${periodNames[p]}</div>`).join('')}
+    </div>
+    <div style="font-size:11px;color:var(--text3);margin-bottom:14px">
+      Rolling ${periodNames[SHOCKER_PERIOD].toLowerCase()} price % change and volume vs each stock's own average — click any row for full detail.
+    </div>
+    <div class="grid-2" style="margin-bottom:16px">
+      ${table('Price Gainers','var(--green)','ti-arrow-up-circle',data.gainers,'No gainers for this period yet.')}
+      ${table('Price Losers','var(--red)','ti-arrow-down-circle',data.losers,'No losers for this period yet.')}
+    </div>
+    ${table('Volume Shockers','var(--amber)','ti-bolt',data.volume,'No volume shockers for this period yet.')}
+  `;
+  panel.querySelectorAll('.subtab').forEach(t=>t.addEventListener('click',()=>{
+    SHOCKER_PERIOD=t.dataset.period;
+    renderShockers();
+  }));
+}
+
+// ─── Streaks Panel (v4.2 — consecutive gainers/losers) ──────────
+function renderStreaks(){
+  const panel=document.getElementById('panel-streaks');
+  if(!['daily','weekly'].includes(STREAK_KIND)) STREAK_KIND='daily';
+  const cons=SHOCKERS.consecutive||{};
+  const dailyMin=cons.daily?.minStreak??3, weeklyMin=cons.weekly?.minStreak??2;
+  const block=cons[STREAK_KIND]||{gainers:[],losers:[],minStreak:STREAK_KIND==='daily'?dailyMin:weeklyMin};
+  const unit=STREAK_KIND==='daily'?'days':'weeks';
+
+  const rowHtml=r=>`
+    <tr onclick="openModal('${esc(r.sym)}')">
+      <td>${esc(r.sym.replace('.NS',''))}</td>
+      <td style="font-weight:600">${r.len} ${unit}</td>
+      <td style="color:var(--text2);font-size:12px">${esc(r.start)} → ${esc(r.end)}</td>
+      <td style="color:${r.dir==='UP'?'var(--green)':'var(--red)'};font-weight:600">${fPct(r.cumPct)}</td>
+      <td>₹${fNum(r.close)}</td>
+    </tr>`;
+
+  const table=(title,color,icon,rows)=>`
+    <div class="tbl-wrap">
+      <div class="tbl-head">
+        <span class="tbl-title"><span style="color:${color}"><i class="ti ${icon}"></i> ${title}</span></span>
+        <span style="font-size:11px;color:var(--text3)">${rows.length} stocks</span>
+      </div>
+      <div style="overflow-x:auto"><table>
+        <thead><tr><th>Symbol</th><th>Streak</th><th>Span</th><th>Cumulative %</th><th>Close</th></tr></thead>
+        <tbody>${rows.length ? rows.map(rowHtml).join('') :
+          `<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:20px">No streak of ${block.minStreak}+ ${unit} right now.</td></tr>`}</tbody>
+      </table></div>
+    </div>`;
+
+  panel.innerHTML=`
+    <div class="subtabs" id="streak-subtabs">
+      <div class="subtab ${STREAK_KIND==='daily'?'active':''}" data-kind="daily">Daily (${dailyMin}+ days)</div>
+      <div class="subtab ${STREAK_KIND==='weekly'?'active':''}" data-kind="weekly">Weekly (${weeklyMin}+ weeks)</div>
+    </div>
+    <div style="font-size:11px;color:var(--text3);margin-bottom:14px">
+      Stocks on an uninterrupted run of higher (or lower) closes — a single flat/unchanged close ends the streak.
+    </div>
+    <div class="grid-2">
+      ${table('Consecutive Gainers','var(--green)','ti-trending-up',block.gainers)}
+      ${table('Consecutive Losers','var(--red)','ti-trending-down',block.losers)}
+    </div>
+  `;
+  panel.querySelectorAll('.subtab').forEach(t=>t.addEventListener('click',()=>{
+    STREAK_KIND=t.dataset.kind;
+    renderStreaks();
+  }));
+}
+
 async function loadAndRender() {
   // Opening the .html file directly (file://) means fetch() can never reach a live
   // server — this is the #1 cause of "dashboard is stuck on demo data" reports. Detect
@@ -1313,6 +1464,10 @@ function applyLiveData(live) {
   // v4.1
   if (live.sectorRotation && live.sectorRotation.length) SECTOR_ROTATION = live.sectorRotation;
   if (live.session && live.session.weightSource) WEIGHT_SOURCE = live.session.weightSource;
+  // v4.2: price/volume shockers + consecutive-mover streaks — null-safe (older server
+  // payloads, or a session whose scanDate lookup failed, won't have this key; keep demo
+  // data rather than blanking the panels).
+  if (live.shockers) SHOCKERS = live.shockers;
 
   // Replace STOCKS with live data
   STOCKS.length = 0;
@@ -1381,6 +1536,8 @@ function renderAll() {
   renderMatrix();
   renderLevels();
   renderSupertrend();
+  renderShockers();
+  renderStreaks();
 }
 
 // ═══════════════════════════════════════════════════════════════

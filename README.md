@@ -1,4 +1,87 @@
-# NSE Momentum Stock Scanner — Production v4.1
+# NSE Momentum Stock Scanner — Production v4.3
+
+## What's new in v4.3 (scan speed: ~6-8 min → ~2-3 min)
+
+**The actual bottleneck, found by doing the arithmetic instead of guessing:** each of the
+~500 tickers in the universe makes 6 sequential timeframe fetches (see
+`ScanEngine.RunAsync`), so a full scan is ≈3,000 HTTP calls to Yahoo. Wall time for that is
+essentially `total_calls × avg_latency ÷ MaxConcurrentFetches` — CPU-side scoring and SQLite
+writes are comparatively negligible (bulk inserts in single transactions, pre-computed
+indicator arrays reused across all scored dates). `MaxConcurrentFetches` defaults to `5` in
+`Config`, but the shipped `appsettings.json` explicitly pinned it to `2` — at that
+concurrency, 3,000 calls at a few hundred ms each lands almost exactly on the reported
+6-8 minutes. That mismatch, not some deep architectural problem, was most of it.
+
+| Change | Detail |
+|--------|--------|
+| **`MaxConcurrentFetches`: 2 → 6** | Fixes the `appsettings.json`/code-default mismatch above and goes a bit further. Expect roughly a 2.5-3× speedup (≈6-8 min → ≈2-3 min) — not a clean 3× since CPU/DB work and some retries don't shrink linearly with fetch concurrency. |
+| **Coordinated rate-limit cooldown** | Previously each of the (now more numerous) concurrent workers handled its own 429s independently — several workers could all get rate-limited within the same second, each wait out its own `Retry-After`, then all resume hitting Yahoo in the same instant: the exact synchronized-burst pattern that turns a transient rate-limit into a longer one. Now a 429 from *any* worker pauses *every* worker's next request via a shared, `Interlocked`-based cooldown (`YahooDataFetcher.WaitForGlobalCooldownAsync`/`ExtendGlobalCooldown`) until it clears, so the whole scan backs off and resumes together. This is what makes raising concurrency a reasonable trade rather than just "hit Yahoo harder and hope." |
+| **HTTP/2 request multiplexing** | `HttpClient.DefaultRequestVersion = HttpVersion.Version20` with `DefaultVersionPolicy = RequestVersionOrLower` (safe fallback to HTTP/1.1 if Yahoo's endpoint doesn't negotiate it). Lets concurrent requests to the same host multiplex over one connection instead of each needing its own TCP+TLS handshake. |
+
+**This isn't a free lunch, and it's worth saying plainly:** the same ~3,000 requests
+compressed into a third of the wall-clock time means a *higher* instantaneous
+requests/second against Yahoo's undocumented endpoint — that's the actual axis a rate
+limiter watches, not raw concurrent-connection count. Earlier comments in this codebase
+(`RetryBaseDelayMs` raised "to respect rate limits", 5-minute intraday lookback deliberately
+cut after triggering bans) show this has already been tuned down once before after running
+into real limits. `6` was chosen as a moderate step specifically because it's paired with
+the coordinated cooldown above, not as a number to keep pushing — **if the Data Quality
+panel's skipped-ticker count rises noticeably after this change, or the console/log shows
+repeated 429 warnings, dial `MaxConcurrentFetches` back down** via `appsettings.json` (`4`
+as a middle ground, `2` to restore the exact old behavior) rather than editing the code
+default. Verified with a real, hand-run 40-task concurrent stress test against the
+cooldown-gate algorithm specifically (see Known Limitations) — but scan-time-in-the-wild
+against Yahoo's live rate limiter can only really be confirmed by running it.
+
+---
+
+## What's new in v4.2 (performance, production hardening, price/volume shockers + consecutive movers)
+
+Two tracks: real fixes to existing code (found by re-reading the scanner and dashboard
+end to end, not speculative rewrites), and one new dashboard feature.
+
+**Performance:**
+
+| Area | v4.1 behavior | v4.2 behavior |
+|------|---------------|---------------|
+| CSV export | Re-scanned the *entire* session's result list for every date × timeframe combination — O(dates × timeframes × N) | Pre-grouped once into a dictionary keyed by (date, timeframe) — O(N). With ~500 tickers × 6 timeframes × `ScanHistoryDays` rows this was doing tens of millions of redundant comparisons for what a single `GroupBy` does in one pass — the same "pre-group for O(1) lookup" fix v2.0 already applied to aggregation, just missed here |
+| Aggregation per-ticker loop | `tfResults.MaxBy(r => r.ScanDate)` — an O(n) scan to find "today's" row | `tfResults[^1]` — the list is already built in ascending-date order by `TickerScorer`, so the last element already *is* the max |
+| Dashboard queries | `scan_results`/`aggregated_results` indexes didn't lead with `session_id`, even though every dashboard read filters by it first (it's the highest-cardinality, cheapest filter available) | Added `idx_sr_session_tf_sym_date` and `idx_agg_session_date` — both `session_id`-led, covering the existing per-session reads *and* the new shockers query below |
+
+**Production hardening:**
+
+| Area | v4.1 behavior | v4.2 behavior |
+|------|---------------|---------------|
+| 429 (rate-limit) retries | Comment claimed 429 retries didn't consume the real-failure retry budget, but `continue` inside a `for` loop still runs the loop's `attempt++` — so a burst of rate-limiting could silently exhaust the budget meant for genuine transient errors, causing tickers to be skipped that more patience would have recovered | 429s now use their own separate, capped counter (`maxRateLimitRetries = 6`), completely independent of the real-failure attempt budget |
+| Config validation | The live scanner had no equivalent of the fail-fast checks the backtest engine already runs on its own settings — a bad `appsettings.json` (zero concurrency, negative history window, etc.) would fail confusingly deep inside the engine, or silently degrade | `Config.Validate()` runs once at startup for every mode except `--help`, listing every problem with its actual value in one clear message |
+
+**New: price/volume shockers + consecutive gainers/losers** — three new panels' worth of
+data, computed live from the daily bars the scanner already persists (no extra Yahoo
+calls, no new tables — same "always fresh, rebuilt from the DB on every dashboard
+request" design as every other panel):
+
+- **Shockers tab** — four rolling windows (1 Day / 3 Days / 1 Week / 1 Month, i.e. 1/3/5/21
+  trading days), each with Price Gainers, Price Losers, and Volume Shockers tables. Price %
+  change is close-to-close over the window; volume ratio is the window's mean daily volume
+  divided by the stock's own trailing average volume (the same baseline the live scorer
+  already uses for its single-day volume-surge signal, `Config.VolumeSmaPeriod`, applied
+  over a longer window). A configurable price floor (`ShockerMinPriceInr`, defaults to the
+  same `MinPriceInr` the BUY gate uses) keeps penny-stock noise out.
+- **Streaks tab** — stocks currently on an uninterrupted run of higher (or lower) daily
+  closes (`ConsecutiveDailyMinStreak`, default 3+ days) or weekly closes
+  (`ConsecutiveWeeklyMinStreak`, default 2+ weeks; a week's close is its last trading day's
+  close, grouped by ISO week). A single flat/unchanged close ends a streak rather than
+  extending it either way.
+- **Assumption worth knowing:** the daily bars available for this are whatever the current
+  session persisted, i.e. the last `ScanHistoryDays` calendar days (default 30, ≈20-22
+  trading days) — enough margin for 1D/3D/1W, and *usually* just enough for the 21-trading-day
+  1M window, but a symbol with a short current-session history (new listing, or you just
+  lowered `ScanHistoryDays`) simply won't appear in the 1M list rather than erroring. Bump
+  `ScanHistoryDays` if you want more headroom.
+- Every new setting lives under `appsettings.json` (`ShockerTopCount`, `ShockerMinPriceInr`,
+  `ConsecutiveDailyMinStreak`, `ConsecutiveWeeklyMinStreak`) — see the Configuration section.
+
+---
 
 ## What's new in v4.1 (sector rotation, fundamental screen, earnings blackout, weight optimizer)
 
@@ -141,7 +224,7 @@ built-in demo data so you can still explore the UI.
 ```json
 {
   "ScanHistoryDays":       30,
-  "MaxConcurrentFetches":   2,
+  "MaxConcurrentFetches":   6,
   "TopBuyCount":           30,
   "TopSellCount":          20,
   "KeepSessionCount":      10,
@@ -150,9 +233,16 @@ built-in demo data so you can still explore the UI.
   "SkipWeekends": true,
   "SkipHolidays": true,
   "DashboardPort": 5080,
-  "DashboardHost": "localhost"
+  "DashboardHost": "localhost",
+
+  "ShockerTopCount": 25,
+  "ShockerMinPriceInr": null,
+  "ConsecutiveDailyMinStreak": 3,
+  "ConsecutiveWeeklyMinStreak": 2
 }
 ```
+`ShockerMinPriceInr: null` means "use `MinPriceInr`'s value" (the same floor the live BUY
+gate uses) — set an explicit number to give the Shockers panels their own floor.
 
 ---
 
@@ -206,6 +296,8 @@ dashboard_data.json            ← generated by export_dashboard_data.py
 | Score Matrix | Color-coded grid (every stock × every timeframe) |
 | Price Levels | 52-week · Quarterly · Monthly · Weekly H/L with % distances |
 | Supertrend | Days in trend · Last flip · HH / HL / LH / LL + days-ago |
+| Shockers *(v4.2)* | Price gainers/losers + volume shockers, four rolling windows (1D/3D/1W/1M) |
+| Streaks *(v4.2)* | Stocks on a consecutive daily (3+) or weekly (2+) up/down closing streak |
 
 Click any row for a full stock detail modal with score breakdown,
 range meters, supertrend analysis, and links to NSE + Yahoo charts.
@@ -274,14 +366,35 @@ range meters, supertrend analysis, and links to NSE + Yahoo charts.
 
 ## Known Limitations / Suggested Next Steps
 
-- **This environment has no .NET SDK**, so `Program.cs` could not be compiled here. Every
-  edit was reviewed by hand (brace/paren balance verified programmatically across the whole
-  file, including after the v4.1 additions), but please run `dotnet restore && dotnet build`
-  locally before trusting this in production. The dashboard's JavaScript *was* verified —
-  `node --check` confirms valid syntax, and a jsdom smoke test exercised every tab, the
-  regime banner (including the v4.1 weight-source indicator), the Sector & Fundamentals
-  modal section, the EARN/EXT/ILLIQ badges, sorting, search, and the stock detail modal
-  end-to-end with zero runtime errors — including the "no fundamentals data" fallback path.
+- **This environment has no *network* access to NuGet** (`nuget.org` isn't reachable from
+  the sandbox this was built in — only a fixed allowlist of other domains is), so
+  `dotnet restore`/`dotnet build` on the actual project isn't possible here. Please run
+  `dotnet restore && dotnet build` locally before trusting this in production. That said,
+  verification went further than a brace-balance read-through: a real .NET 8 SDK was
+  installed locally, and every new piece of logic with no external (Sqlite/Serilog/ASP.NET)
+  dependency was extracted verbatim and compiled+run standalone against the SDK's reference
+  assemblies (bypassing NuGet entirely):
+  - `ShockersAnalyzer` (v4.2) — 23 test cases covering the price/volume math, the min-price
+    filter, insufficient-history skipping, flat-close/reversal streak breaks, ISO-week
+    grouping, and empty/single-bar edge cases. Caught and fixed one real bug (an `init`-only
+    property assigned after construction, which would not have compiled).
+  - The v4.3 coordinated rate-limit cooldown gate (`WaitForGlobalCooldownAsync`/
+    `ExtendGlobalCooldown`) — 9 test cases including a 40-task concurrent stress test,
+    confirming the compare-and-swap "never shorten an existing cooldown" logic actually
+    holds under real concurrent load rather than just reading correctly.
+
+  The rest of the file (which does depend on Sqlite/Serilog/ASP.NET Core and so couldn't be
+  compiled the same way) still only got a careful manual review plus a whole-file
+  brace/paren/bracket balance check. The dashboard's JavaScript was verified similarly:
+  `node --check` confirms valid syntax, and the entire script — not just new panels — was
+  run end-to-end in a `vm.createContext` DOM-stub harness (demo-data path, all render
+  functions, `applyLiveData` with both a full payload and one that omits optional keys for
+  null-safety) with zero runtime errors.
+  - **One thing this kind of offline verification genuinely cannot confirm:** whether v4.3's
+    higher `MaxConcurrentFetches` actually behaves well against Yahoo's *live* rate limiter —
+    the cooldown-gate *algorithm* is proven correct under stress, but "does Yahoo start
+    banning us at concurrency 6" is an empirical question only a real run can answer. Watch
+    the Data Quality panel and console warnings after upgrading, per the v4.3 section above.
 - `WeightOptimizer.cs` (the `--optimize-weights` search) is new code that reuses the
   existing `BacktestEngine`/`PerformanceAnalyzer` rather than reimplementing simulation
   logic, which limits its own surface area for bugs, but it hasn't been run end-to-end here

@@ -229,6 +229,12 @@ namespace NseMomentumScanner
         public bool?   EnableEarningsBlackout        { get; set; }
         public int?    EarningsBlackoutDays          { get; set; }
 
+        // ── v4.2: price/volume shockers + consecutive gainers/losers (dashboard) ───────
+        public int?    ShockerTopCount               { get; set; }
+        public double? ShockerMinPriceInr            { get; set; }
+        public int?    ConsecutiveDailyMinStreak     { get; set; }
+        public int?    ConsecutiveWeeklyMinStreak    { get; set; }
+
         private const string FileName = "appsettings.json";
 
         public static AppSettings Load()
@@ -275,8 +281,21 @@ namespace NseMomentumScanner
     };
 
         // ── System & Network ──────────────────────────────────────────────────
+        // v4.3 speed note: the actual scan-time bottleneck was here, not CPU or DB. Each of
+        // the ~500 tickers makes 6 sequential timeframe fetches (see ScanEngine.RunAsync),
+        // so total network calls per scan ≈ tickers × 6, and total wall time ≈ that count ×
+        // avg-fetch-time / MaxConcurrentFetches — at the old default of 2, a 6-8 minute scan
+        // was the expected result, not a bug. Raised to 6 (paired with the new coordinated
+        // rate-limit cooldown below, plus HTTP/2 request multiplexing) for a real ~2.5-3×
+        // speedup. This isn't a free lunch, though: the same total request volume compressed
+        // into less wall-clock time means a HIGHER instantaneous requests/sec against Yahoo,
+        // which is the actual axis their rate limiter watches — it's not just "more
+        // concurrent connections" for free. If the Data Quality panel's skipped-ticker count
+        // rises noticeably after this change, or the console shows repeated 429 warnings,
+        // dial MaxConcurrentFetches back down (4 as a middle ground, 2 to restore the old
+        // behavior exactly) via appsettings.json rather than editing this default.
         public static int ScanHistoryDays => _s.ScanHistoryDays ?? 30;
-        public static int MaxConcurrentFetches => _s.MaxConcurrentFetches ?? 5;   // Increased from 2 for speed
+        public static int MaxConcurrentFetches => _s.MaxConcurrentFetches ?? 6;   // see v4.3 notes below
         public static int FetchTimeoutSeconds => _s.FetchTimeoutSeconds ?? 30;
         public static int MaxRetries => _s.MaxRetries ?? 3;
         public static int RetryBaseDelayMs => _s.RetryBaseDelayMs ?? 1500; // Increased to respect rate limits
@@ -473,6 +492,64 @@ namespace NseMomentumScanner
         // fires for symbols where a next_earnings_date is actually known.
         public static bool EnableEarningsBlackout => _s.EnableEarningsBlackout ?? true;
         public static int  EarningsBlackoutDays   => _s.EarningsBlackoutDays ?? 3;
+
+        // ── v4.2: price/volume shockers + consecutive gainers/losers ───────────────────
+        // Rolling trading-day windows computed directly from the daily bars already
+        // persisted for the current session — no extra Yahoo calls, no new tables, same
+        // "always fresh, built from the live DB on every request" design as every other
+        // dashboard panel. See ShockersAnalyzer for the actual computation.
+        public static readonly (int TradingDays, string Label)[] ShockerPeriods =
+        {
+            (1,  "1D"),
+            (3,  "3D"),
+            (5,  "1W"),   // 5 trading days ≈ 1 calendar week
+            (21, "1M"),   // 21 trading days ≈ 1 calendar month
+        };
+        public static int    ShockerTopCount            => _s.ShockerTopCount ?? 25;
+        // Defaults to the same liquidity price floor as the live BUY gate (MinPriceInr) —
+        // a separate knob only if you want shockers to include names the BUY gate would not.
+        public static double ShockerMinPriceInr         => _s.ShockerMinPriceInr ?? MinPriceInr;
+        public static int    ConsecutiveDailyMinStreak  => _s.ConsecutiveDailyMinStreak ?? 3;
+        public static int    ConsecutiveWeeklyMinStreak => _s.ConsecutiveWeeklyMinStreak ?? 2;
+
+        /// <summary>
+        /// Fail-fast sanity check on the *effective* config (compile-time defaults +
+        /// appsettings.json overrides combined) — called once at startup for every mode that
+        /// actually touches the network or the DB (not --help). Mirrors the same philosophy
+        /// the backtest engine already applies to its own settings: a nonsensical value (zero
+        /// concurrency, a negative history window, an inverted count) should produce one clear
+        /// message here, not a confusing failure — or worse, a silently-empty/degenerate scan —
+        /// three layers deeper in the code.
+        /// </summary>
+        public static void Validate()
+        {
+            var errors = new List<string>();
+            if (ScanHistoryDays <= 0) errors.Add($"ScanHistoryDays must be > 0 (was {ScanHistoryDays})");
+            if (MaxConcurrentFetches <= 0) errors.Add($"MaxConcurrentFetches must be > 0 (was {MaxConcurrentFetches})");
+            if (FetchTimeoutSeconds <= 0) errors.Add($"FetchTimeoutSeconds must be > 0 (was {FetchTimeoutSeconds})");
+            if (MaxRetries < 0) errors.Add($"MaxRetries must be >= 0 (was {MaxRetries})");
+            if (RetryBaseDelayMs < 0) errors.Add($"RetryBaseDelayMs must be >= 0 (was {RetryBaseDelayMs})");
+            if (KeepSessionCount <= 0) errors.Add($"KeepSessionCount must be > 0 (was {KeepSessionCount})");
+            if (TopBuyCount <= 0) errors.Add($"TopBuyCount must be > 0 (was {TopBuyCount})");
+            if (TopSellCount <= 0) errors.Add($"TopSellCount must be > 0 (was {TopSellCount})");
+            if (string.IsNullOrWhiteSpace(DbPath)) errors.Add("DbPath cannot be empty");
+            if (string.IsNullOrWhiteSpace(CsvBaseDir)) errors.Add("CsvBaseDir cannot be empty");
+            if (DashboardPort is <= 0 or > 65535) errors.Add($"DashboardPort must be 1-65535 (was {DashboardPort})");
+            if (string.IsNullOrWhiteSpace(DashboardHost)) errors.Add("DashboardHost cannot be empty");
+            if (ShockerTopCount <= 0) errors.Add($"ShockerTopCount must be > 0 (was {ShockerTopCount})");
+            if (ShockerMinPriceInr < 0) errors.Add($"ShockerMinPriceInr must be >= 0 (was {ShockerMinPriceInr})");
+            if (ConsecutiveDailyMinStreak < 2) errors.Add($"ConsecutiveDailyMinStreak must be >= 2 (was {ConsecutiveDailyMinStreak})");
+            if (ConsecutiveWeeklyMinStreak < 2) errors.Add($"ConsecutiveWeeklyMinStreak must be >= 2 (was {ConsecutiveWeeklyMinStreak})");
+            if (VcpWeight < 0 || VolumeWeight < 0 || TrendAlignmentWeight < 0 ||
+                SupertrendWeight < 0 || HmaCrossoverWeight < 0 || AdxWeight < 0)
+                errors.Add("All *Weight scoring settings must be >= 0");
+
+            if (errors.Count == 0) return;
+            foreach (var e in errors) Log.Error("Config error: {E}", e);
+            throw new InvalidOperationException(
+                $"Invalid configuration ({errors.Count} error(s)) — fix appsettings.json and retry. " +
+                "See the 'Config error' lines above for specifics.");
+        }
     }
 
     /// <summary>
@@ -727,6 +804,52 @@ namespace NseMomentumScanner
         public double AvgScore        { get; set; }
         public double AvgRsRaw        { get; set; }
         public double RankPercentile  { get; set; } // 1-99, higher = stronger sector right now
+    }
+
+    // =========================================================================
+    //  v4.2: SHOCKERS / CONSECUTIVE-MOVERS MODELS
+    //  See ShockersAnalyzer for the computation; nothing here is persisted to its own
+    //  table — it's derived fresh from scan_results on every dashboard request, same as
+    //  every other panel.
+    // =========================================================================
+
+    /// <summary>One symbol's price or volume shocker reading for a rolling period (see
+    /// Config.ShockerPeriods). PctChange is close-to-close over the period; VolumeRatio is
+    /// the period's mean daily volume divided by the symbol's own trailing average volume
+    /// (Config.VolumeSmaPeriod, the same baseline the live scorer already uses for its own
+    /// single-day volume-surge signal) as of the most recent bar.</summary>
+    internal sealed record ShockerRow(
+        string Symbol, decimal Close, double PctChange, double VolumeRatio, double AvgTurnoverInr);
+
+    /// <summary>A symbol currently on an N-or-longer consecutive up/down closing streak.
+    /// Direction is "UP" (strictly higher closes) or "DOWN" (strictly lower closes) — a
+    /// flat/unchanged close breaks the streak rather than extending it either way.
+    /// CumulativePctChange spans the whole streak (StreakStart's prior close → StreakEnd's
+    /// close), not just the latest bar.</summary>
+    internal sealed record StreakRow(
+        string Symbol, int StreakLength, string Direction,
+        DateTime StreakStart, DateTime StreakEnd, double CumulativePctChange, decimal LastClose);
+
+    /// <summary>One rolling period's shocker lists (see Config.ShockerPeriods for which
+    /// periods are computed).</summary>
+    internal sealed class PeriodShockers
+    {
+        public List<ShockerRow> PriceGainers { get; init; } = new();
+        public List<ShockerRow> PriceLosers  { get; init; } = new();
+        public List<ShockerRow> VolumeSurges { get; init; } = new();
+    }
+
+    /// <summary>Full output of ShockersAnalyzer.Build: one PeriodShockers per
+    /// Config.ShockerPeriods label, plus daily/weekly consecutive-mover streaks.</summary>
+    internal sealed class ShockersResult
+    {
+        public Dictionary<string, PeriodShockers> Periods { get; } = new();
+        // Regular (not init-only) setters: BuildStreaks populates these after the
+        // ShockersResult has already been constructed and partially filled in by Build().
+        public List<StreakRow> DailyStreakGainers  { get; set; } = new();
+        public List<StreakRow> DailyStreakLosers   { get; set; } = new();
+        public List<StreakRow> WeeklyStreakGainers { get; set; } = new();
+        public List<StreakRow> WeeklyStreakLosers  { get; set; } = new();
     }
 
     /// <summary>Pre-computed indicator arrays indexed to match quotes list.</summary>
@@ -1337,6 +1460,9 @@ namespace NseMomentumScanner
     //  · No inner SemaphoreSlim (Parallel.ForEachAsync DOP already limits concurrency)
     //  · HTTP 429 / Retry-After detection with exponential + full-jitter backoff
     //  · Tries query1 then query2 endpoints
+    //  · v4.3: HTTP/2 request multiplexing + a shared, coordinated rate-limit cooldown
+    //    (see WaitForGlobalCooldownAsync/ExtendGlobalCooldown) — both added so
+    //    MaxConcurrentFetches could safely go up without just hammering Yahoo harder.
     // =========================================================================
     internal sealed class YahooDataFetcher : IDisposable
     {
@@ -1347,6 +1473,50 @@ namespace NseMomentumScanner
         // Shared RNG — safe for concurrent reads with Random.Shared
         private static readonly Random _rng = Random.Shared;
 
+        // ── v4.3: coordinated rate-limit cooldown ───────────────────────────────
+        // One YahooDataFetcher instance is shared by every concurrent worker in
+        // ScanEngine's Parallel.ForEachAsync, so this field is genuinely shared state.
+        // Before this existed, each worker handled its own 429s independently — with
+        // MaxConcurrentFetches raised, several workers could all get rate-limited within
+        // the same second, each wait out its own Retry-After, and then all resume hitting
+        // Yahoo again in the same instant, which is exactly the kind of synchronized burst
+        // that turns a transient rate-limit into a longer one. Now a 429 from *any* worker
+        // pauses *every* worker's next request until the shared cooldown clears, so the
+        // whole scan backs off and resumes together instead of each ticker fighting its own
+        // fire alone. Read/written only via Interlocked — plain long read/write isn't
+        // guaranteed atomic on 32-bit platforms, and Interlocked is what the rest of this
+        // codebase already uses for shared counters (see ScanEngine's progress counter).
+        private long _globalCooldownUntilTicks;
+
+        private async Task WaitForGlobalCooldownAsync(CancellationToken ct)
+        {
+            while (true)
+            {
+                long untilTicks = Interlocked.Read(ref _globalCooldownUntilTicks);
+                long nowTicks   = DateTime.UtcNow.Ticks;
+                if (untilTicks <= nowTicks) return;
+                var wait = TimeSpan.FromTicks(untilTicks - nowTicks);
+                if (wait <= TimeSpan.FromMilliseconds(50)) return; // close enough, avoid delay churn
+                await Task.Delay(wait, ct);
+            }
+        }
+
+        /// <summary>Extends the shared cooldown to at least now+<paramref name="seconds"/>.
+        /// Never shortens it — a compare-and-swap loop so two workers hitting 429 at nearly
+        /// the same moment can only push the cooldown later, never accidentally stomp a
+        /// longer wait with a shorter one (the classic lost-update race a plain field write
+        /// would allow).</summary>
+        private void ExtendGlobalCooldown(int seconds)
+        {
+            long candidate = DateTime.UtcNow.AddSeconds(seconds).Ticks;
+            long current;
+            do
+            {
+                current = Interlocked.Read(ref _globalCooldownUntilTicks);
+                if (candidate <= current) return;
+            } while (Interlocked.CompareExchange(ref _globalCooldownUntilTicks, candidate, current) != current);
+        }
+
         public YahooDataFetcher()
         {
             var handler = new HttpClientHandler
@@ -1355,7 +1525,13 @@ namespace NseMomentumScanner
             };
             _http = new HttpClient(handler)
             {
-                Timeout = TimeSpan.FromSeconds(Config.FetchTimeoutSeconds)
+                Timeout = TimeSpan.FromSeconds(Config.FetchTimeoutSeconds),
+                // v4.3: prefer HTTP/2 (single multiplexed connection per host instead of one
+                // TCP+TLS handshake per concurrent request) with a safe fallback to HTTP/1.1
+                // if Yahoo's endpoint doesn't negotiate it — RequestVersionOrLower never
+                // fails a request over this, it just doesn't get the multiplexing win.
+                DefaultRequestVersion = HttpVersion.Version20,
+                DefaultVersionPolicy  = HttpVersionPolicy.RequestVersionOrLower,
             };
             _http.DefaultRequestHeaders.Add("User-Agent",
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -1398,11 +1574,26 @@ namespace NseMomentumScanner
             string escaped  = Uri.EscapeDataString(ticker);
 
             Exception? lastEx = null;
-            int totalAttempts = Config.MaxRetries + 2; // extra budget for 429 retries
+            int totalAttempts = Config.MaxRetries + 2; // budget for real (non-429) failures
 
-            for (int attempt = 0; attempt < totalAttempts; attempt++)
+            // 429s are rate-limit backpressure, not failures — they get their own small,
+            // separate retry budget so a burst of rate-limiting can't silently eat into (or
+            // exhaust) the real-failure budget above. The `for` loop's `attempt++` runs even on
+            // `continue`, so the previous version's "retry without decrementing effective
+            // budget" comment didn't actually hold — a run of 429s could consume the whole
+            // totalAttempts budget on rate-limit waits alone, leaving zero attempts for an
+            // actual transient network error and causing tickers to be skipped that a bit more
+            // patience would have recovered. Tracked as its own counter instead.
+            int rateLimitRetries = 0;
+            const int maxRateLimitRetries = 6;
+
+            int attempt = 0;
+            while (attempt < totalAttempts)
             {
                 ct.ThrowIfCancellationRequested();
+                // v4.3: honor any cooldown another worker's 429 may have just set — see the
+                // class-level comment on _globalCooldownUntilTicks for why this exists.
+                await WaitForGlobalCooldownAsync(ct);
                 string host = _hosts[attempt % _hosts.Length];
                 string url  = $"https://{host}/v8/finance/chart/{escaped}" +
                               $"?period1={period1}&period2={period2}&interval={intStr}" +
@@ -1411,20 +1602,30 @@ namespace NseMomentumScanner
                 {
                     using var resp = await _http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
 
-                    // Handle rate limiting specifically
+                    // Handle rate limiting specifically — doesn't consume the real-attempt budget.
                     if (resp.StatusCode == HttpStatusCode.TooManyRequests)
                     {
+                        if (++rateLimitRetries > maxRateLimitRetries)
+                        {
+                            lastEx = new HttpRequestException("HTTP 429 (rate-limit retry budget exhausted)");
+                            break;
+                        }
                         int waitSec = (int)(resp.Headers.RetryAfter?.Delta?.TotalSeconds ?? 60);
                         waitSec = Math.Clamp(waitSec, 30, 300);
-                        Log.Warning("429 for {Ticker} — waiting {Sec}s then retrying", ticker, waitSec);
-                        await Task.Delay(TimeSpan.FromSeconds(waitSec), ct);
-                        continue; // retry without decrementing effective budget
+                        // Pauses every concurrent worker's next request, not just this one —
+                        // the actual wait happens at the top of this loop (and every other
+                        // in-flight worker's loop) via WaitForGlobalCooldownAsync.
+                        ExtendGlobalCooldown(waitSec);
+                        Log.Warning("429 for {Ticker} — pausing all workers {Sec}s then retrying ({N}/{Max})",
+                            ticker, waitSec, rateLimitRetries, maxRateLimitRetries);
+                        continue; // does not increment `attempt` — real budget untouched
                     }
 
                     if (!resp.IsSuccessStatusCode)
                     {
                         lastEx = new HttpRequestException($"HTTP {(int)resp.StatusCode}");
                         await ApplyBackoff(attempt, ct);
+                        attempt++;
                         continue;
                     }
 
@@ -1436,11 +1637,12 @@ namespace NseMomentumScanner
                 {
                     lastEx = ex;
                     await ApplyBackoff(attempt, ct);
+                    attempt++;
                 }
             }
 
-            Log.Warning("Gave up on {Ticker} ({Interval}) after {N} attempts: {Msg}",
-                ticker, intStr, totalAttempts, lastEx?.Message);
+            Log.Warning("Gave up on {Ticker} ({Interval}) after {N} attempts ({R} rate-limit waits): {Msg}",
+                ticker, intStr, attempt, rateLimitRetries, lastEx?.Message);
             return new List<StockQuote>();
         }
 
@@ -2427,6 +2629,146 @@ namespace NseMomentumScanner
                 .ToList();
         }
     }
+
+    // =========================================================================
+    //  v4.2: SHOCKERS / CONSECUTIVE-MOVERS ANALYZER
+    //  Pure, allocation-conscious analytics over the current session's own daily bars
+    //  (already fetched + persisted for the "1d" timeframe — no extra Yahoo calls). Every
+    //  period/streak is computed with a single backward index walk per symbol; there's no
+    //  per-period re-querying or re-sorting of the input series.
+    // =========================================================================
+    internal static class ShockersAnalyzer
+    {
+        /// <summary>One symbol's daily bar, ascending by date. AvgVolume is the same
+        /// trailing SMA the live scorer persists as scan_results.avg_volume.</summary>
+        internal readonly record struct DailyBar(DateTime Date, decimal Close, double Volume, double AvgVolume);
+
+        public static ShockersResult Build(Dictionary<string, List<DailyBar>> bySymbol)
+        {
+            var result = new ShockersResult();
+            int top = Config.ShockerTopCount;
+            double minPrice = Config.ShockerMinPriceInr;
+
+            foreach (var (periodDays, label) in Config.ShockerPeriods)
+            {
+                var gainers = new List<ShockerRow>();
+                var losers  = new List<ShockerRow>();
+                var volume  = new List<ShockerRow>();
+
+                foreach (var (symbol, bars) in bySymbol)
+                {
+                    // Need `periodDays` bars of movement, i.e. periodDays+1 data points.
+                    if (bars.Count < periodDays + 1) continue;
+
+                    var last  = bars[^1];
+                    var prior = bars[bars.Count - 1 - periodDays];
+                    if (prior.Close <= 0 || last.Close < (decimal)minPrice) continue;
+
+                    double pctChange = (double)((last.Close - prior.Close) / prior.Close) * 100.0;
+
+                    double periodVolSum = 0;
+                    for (int k = bars.Count - periodDays; k < bars.Count; k++)
+                        periodVolSum += bars[k].Volume;
+                    double periodMeanVol = periodVolSum / periodDays;
+                    double volRatio = last.AvgVolume > 0 ? periodMeanVol / last.AvgVolume : 0;
+                    double turnover = last.AvgVolume * (double)last.Close;
+
+                    var row = new ShockerRow(symbol, last.Close, Math.Round(pctChange, 2),
+                        Math.Round(volRatio, 2), Math.Round(turnover, 0));
+
+                    if (pctChange >= 0) gainers.Add(row); else losers.Add(row);
+                    volume.Add(row);
+                }
+
+                result.Periods[label] = new PeriodShockers
+                {
+                    PriceGainers = gainers.OrderByDescending(r => r.PctChange).Take(top).ToList(),
+                    PriceLosers  = losers.OrderBy(r => r.PctChange).Take(top).ToList(),
+                    VolumeSurges = volume.OrderByDescending(r => r.VolumeRatio).Take(top).ToList(),
+                };
+            }
+
+            BuildStreaks(bySymbol, result);
+            return result;
+        }
+
+        private static void BuildStreaks(Dictionary<string, List<DailyBar>> bySymbol, ShockersResult result)
+        {
+            int dailyMin  = Config.ConsecutiveDailyMinStreak;
+            int weeklyMin = Config.ConsecutiveWeeklyMinStreak;
+            int top       = Config.ShockerTopCount;
+
+            var dailyUp = new List<StreakRow>(); var dailyDown = new List<StreakRow>();
+            var weeklyUp = new List<StreakRow>(); var weeklyDown = new List<StreakRow>();
+
+            foreach (var (symbol, bars) in bySymbol)
+            {
+                if (bars.Count >= dailyMin + 1)
+                {
+                    var (len, dir, startIdx) = TrailingStreak(bars, b => b.Close);
+                    if (len >= dailyMin)
+                    {
+                        double cum = (double)((bars[^1].Close - bars[startIdx].Close) / bars[startIdx].Close) * 100.0;
+                        var row = new StreakRow(symbol, len, dir, bars[startIdx + 1].Date, bars[^1].Date,
+                            Math.Round(cum, 2), bars[^1].Close);
+                        (dir == "UP" ? dailyUp : dailyDown).Add(row);
+                    }
+                }
+
+                // Weekly closes: last trading-day close in each ISO week, oldest→newest.
+                var weekly = bars
+                    .GroupBy(b => (Year: System.Globalization.ISOWeek.GetYear(b.Date),
+                                    Week: System.Globalization.ISOWeek.GetWeekOfYear(b.Date)))
+                    .Select(g => g.OrderBy(b => b.Date).Last())
+                    .OrderBy(b => b.Date)
+                    .ToList();
+
+                if (weekly.Count >= weeklyMin + 1)
+                {
+                    var (len, dir, startIdx) = TrailingStreak(weekly, b => b.Close);
+                    if (len >= weeklyMin)
+                    {
+                        double cum = (double)((weekly[^1].Close - weekly[startIdx].Close) / weekly[startIdx].Close) * 100.0;
+                        var row = new StreakRow(symbol, len, dir, weekly[startIdx + 1].Date, weekly[^1].Date,
+                            Math.Round(cum, 2), weekly[^1].Close);
+                        (dir == "UP" ? weeklyUp : weeklyDown).Add(row);
+                    }
+                }
+            }
+
+            static IOrderedEnumerable<StreakRow> Rank(List<StreakRow> rows) =>
+                rows.OrderByDescending(r => r.StreakLength).ThenByDescending(r => Math.Abs(r.CumulativePctChange));
+
+            result.DailyStreakGainers  = Rank(dailyUp).Take(top).ToList();
+            result.DailyStreakLosers   = Rank(dailyDown).Take(top).ToList();
+            result.WeeklyStreakGainers = Rank(weeklyUp).Take(top).ToList();
+            result.WeeklyStreakLosers  = Rank(weeklyDown).Take(top).ToList();
+        }
+
+        /// <summary>Walks a chronologically-sorted bar list backward from the end and measures
+        /// the current strictly-monotonic streak in <paramref name="closeOf"/>. Returns streak
+        /// length, direction ("UP"/"DOWN"/"" if fewer than 2 bars or the very last move was
+        /// flat), and the index of the bar *before* the streak began (i.e. the baseline for a
+        /// cumulative % change) — O(n) worst case, but stops at the first break or flat bar.</summary>
+        private static (int Length, string Direction, int BaseIndex) TrailingStreak<T>(
+            IReadOnlyList<T> bars, Func<T, decimal> closeOf)
+        {
+            if (bars.Count < 2) return (0, "", 0);
+            bool? up = null;
+            int i = bars.Count - 1;
+            for (; i > 0; i--)
+            {
+                decimal cur = closeOf(bars[i]), prev = closeOf(bars[i - 1]);
+                if (cur == prev) break; // flat breaks the streak
+                bool thisUp = cur > prev;
+                if (up == null) up = thisUp;
+                else if (up.Value != thisUp) break;
+            }
+            int len = bars.Count - 1 - i;
+            return up == null || len == 0 ? (0, "", bars.Count - 1) : (len, up.Value ? "UP" : "DOWN", i);
+        }
+    }
+
     // =========================================================================
     //  SQLITE REPOSITORY  (all pragmas, FK enforcement, session pruning)
     // =========================================================================
@@ -2552,6 +2894,19 @@ namespace NseMomentumScanner
             CREATE INDEX IF NOT EXISTS idx_agg_date_rec ON aggregated_results(scan_date, recommendation);
             CREATE INDEX IF NOT EXISTS idx_dq_session    ON data_quality_issues(session_id);
             CREATE INDEX IF NOT EXISTS idx_secrot_session ON sector_rotation(session_id, scan_date);
+
+            -- v4.2 perf: every dashboard read (ReadDailyDetailsAsync, ReadHistoryAsync,
+            -- ReadTfBreakdownAsync, and the new shockers series read) filters scan_results by
+            -- session_id first — none of the indexes above lead with it, so SQLite fell back to
+            -- a slower scan_date/symbol-first plan and re-filtered session_id row-by-row. With
+            -- KeepSessionCount sessions of ~500 tickers × 6 timeframes × ScanHistoryDays rows
+            -- accumulated, that filter step was scanning far more rows than necessary. Same
+            -- story for aggregated_results, whose only prior index leads with scan_date, not
+            -- session_id, even though every dashboard query supplies both.
+            CREATE INDEX IF NOT EXISTS idx_sr_session_tf_sym_date
+                ON scan_results(session_id, timeframe, symbol, scan_date);
+            CREATE INDEX IF NOT EXISTS idx_agg_session_date
+                ON aggregated_results(session_id, scan_date, aggregate_score DESC);
             ");
 
             MigrateSchema();
@@ -3339,9 +3694,11 @@ namespace NseMomentumScanner
                             // All results → CSV accumulator
                             foreach (var r in tfResults) allForCsv.Add(r);
 
-                            // Last day only → aggregation accumulator
-                            var last = tfResults.MaxBy(r => r.ScanDate);
-                            if (last != null) lastDayResults.Add(last);
+                            // Last day only → aggregation accumulator. tfResults is already in
+                            // ascending ScanDate order (TickerScorer iterates datesToScore sorted
+                            // ascending), so the last element IS the max — no need for an O(n)
+                            // MaxBy scan per ticker per timeframe.
+                            lastDayResults.Add(tfResults[^1]);
 
                             tickerResults.AddRange(tfResults);
                         }
@@ -3377,21 +3734,22 @@ namespace NseMomentumScanner
             _db.UpdateSessionScored(sessionId, scored);
 
             // ── Write per-date CSV files ───────────────────────────────────────
+            // Pre-group once (O(n)) instead of re-scanning the full csvList for every
+            // date×timeframe combination (was O(dates × timeframes × n) — with ~500 tickers ×
+            // 6 timeframes × ScanHistoryDays rows, that's tens of millions of comparisons for
+            // what a single GroupBy does in one linear pass). Mirrors the "pre-group for O(1)
+            // lookup" fix already applied to aggregation back in v2.0 — this loop was missed.
             Log.Information("Writing CSVs…");
             var csvList   = allForCsv.ToList();
-            var allDates  = csvList.Select(r => r.ScanDate.Date).Distinct().OrderBy(d => d).ToList();
+            var csvGroups = csvList
+                .GroupBy(r => (Date: r.ScanDate.Date, r.Timeframe))
+                .ToDictionary(g => g.Key, g => g.ToList());
+            var allDates  = csvGroups.Keys.Select(k => k.Date).Distinct().OrderBy(d => d).ToList();
 
             foreach (var date in allDates)
-            {
                 foreach (var (_, tfLabel, _, _, _) in Config.ScanTimeframes)
-                {
-                    var subset = csvList
-                        .Where(r => r.ScanDate.Date == date && r.Timeframe == tfLabel)
-                        .ToList();
-                    if (subset.Count > 0)
+                    if (csvGroups.TryGetValue((date, tfLabel), out var subset))
                         CsvExporter.WriteScanResults(subset, date, tfLabel);
-                }
-            }
 
             // ── Aggregate last day ────────────────────────────────────────────
             // marketRegime is a class (reference type) — Aggregate fills in its Breadth*
@@ -3543,6 +3901,25 @@ namespace NseMomentumScanner
                 ? new List<(string Sector, int Count, int Bullish, double AvgScore, double AvgRs, double Rank)>()
                 : await ReadSectorRotationAsync(conn, sid, scanDate, ct);
 
+            // v4.2: price/volume shockers + consecutive gainers/losers — computed fresh from
+            // this session's own daily bars. Wrapped defensively: a bug or an unexpectedly
+            // shaped DB should never take down the rest of the dashboard payload, just this
+            // one section (degrades to empty, logged, same philosophy as every other
+            // best-effort panel here).
+            ShockersResult? shockers = null;
+            if (scanDate != null)
+            {
+                try
+                {
+                    var series = await ReadDailySeriesAsync(conn, sid, ct);
+                    shockers = ShockersAnalyzer.Build(series);
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning("Dashboard shockers computation failed (non-fatal): {Msg}", ex.Message);
+                }
+            }
+
             var stocks = new JsonArray();
             foreach (var r in aggRows)
             {
@@ -3596,6 +3973,7 @@ namespace NseMomentumScanner
                     ["breadthPctBullish"] = regime.Value.BreadthPctBullish,
                 },
                 ["dataQuality"] = BuildDataQualityJson(dataQuality),
+                ["shockers"] = shockers == null ? null : BuildShockersJson(shockers),
             };
 
             return root.ToJsonString(new JsonSerializerOptions { WriteIndented = false });
@@ -3721,6 +4099,98 @@ namespace NseMomentumScanner
                 ["inEarningsBlackout"]  = r.InEarningsBlackout,
                 ["history"] = histArr,
             };
+        }
+
+        // ── v4.2: shockers / consecutive-movers ─────────────────────────────────
+        private static JsonObject BuildShockersJson(ShockersResult sr)
+        {
+            static JsonArray Rows(IEnumerable<ShockerRow> rows)
+            {
+                var arr = new JsonArray();
+                foreach (var r in rows)
+                    arr.Add(new JsonObject
+                    {
+                        ["sym"] = r.Symbol, ["close"] = r.Close, ["pctChange"] = r.PctChange,
+                        ["volR"] = r.VolumeRatio, ["avgTurnover"] = r.AvgTurnoverInr,
+                    });
+                return arr;
+            }
+            static JsonArray Streaks(IEnumerable<StreakRow> rows)
+            {
+                var arr = new JsonArray();
+                foreach (var r in rows)
+                    arr.Add(new JsonObject
+                    {
+                        ["sym"] = r.Symbol, ["len"] = r.StreakLength, ["dir"] = r.Direction,
+                        ["start"] = r.StreakStart.ToString("yyyy-MM-dd"), ["end"] = r.StreakEnd.ToString("yyyy-MM-dd"),
+                        ["cumPct"] = r.CumulativePctChange, ["close"] = r.LastClose,
+                    });
+                return arr;
+            }
+
+            var periods = new JsonObject();
+            foreach (var (_, label) in Config.ShockerPeriods)
+            {
+                if (!sr.Periods.TryGetValue(label, out var p)) continue;
+                periods[label] = new JsonObject
+                {
+                    ["gainers"] = Rows(p.PriceGainers),
+                    ["losers"]  = Rows(p.PriceLosers),
+                    ["volume"]  = Rows(p.VolumeSurges),
+                };
+            }
+
+            return new JsonObject
+            {
+                ["periods"] = periods,
+                ["consecutive"] = new JsonObject
+                {
+                    ["daily"] = new JsonObject
+                    {
+                        ["gainers"] = Streaks(sr.DailyStreakGainers),
+                        ["losers"]  = Streaks(sr.DailyStreakLosers),
+                        ["minStreak"] = Config.ConsecutiveDailyMinStreak,
+                    },
+                    ["weekly"] = new JsonObject
+                    {
+                        ["gainers"] = Streaks(sr.WeeklyStreakGainers),
+                        ["losers"]  = Streaks(sr.WeeklyStreakLosers),
+                        ["minStreak"] = Config.ConsecutiveWeeklyMinStreak,
+                    },
+                },
+            };
+        }
+
+        /// <summary>Reads every "1d" bar persisted for this session, grouped by symbol and
+        /// ordered ascending by date — the raw input ShockersAnalyzer.Build walks to compute
+        /// every rolling-period shocker and consecutive-streak in one pass per symbol. Scoped
+        /// to session_id (not a date range) since each session already only ever persists the
+        /// last Config.ScanHistoryDays calendar days per symbol — see idx_sr_session_tf_sym_date.</summary>
+        private static async Task<Dictionary<string, List<ShockersAnalyzer.DailyBar>>> ReadDailySeriesAsync(
+            SqliteConnection c, int sid, CancellationToken ct)
+        {
+            const string sql = @"
+                SELECT symbol, scan_date, last_close, last_volume, avg_volume
+                FROM scan_results
+                WHERE session_id=@sid AND timeframe='1d'
+                ORDER BY symbol, scan_date";
+            await using var cmd = new SqliteCommand(sql, c);
+            cmd.Parameters.AddWithValue("@sid", sid);
+            await using var rd = await cmd.ExecuteReaderAsync(ct);
+
+            var map = new Dictionary<string, List<ShockersAnalyzer.DailyBar>>(StringComparer.OrdinalIgnoreCase);
+            while (await rd.ReadAsync(ct))
+            {
+                var sym = rd.GetString(0);
+                if (!DateTime.TryParse(rd.GetString(1), CultureInfo.InvariantCulture,
+                        DateTimeStyles.None, out var date))
+                    continue;
+                var bar = new ShockersAnalyzer.DailyBar(
+                    date, (decimal)(GetD(rd, 2) ?? 0), GetD(rd, 3) ?? 0, GetD(rd, 4) ?? 0);
+                if (!map.TryGetValue(sym, out var list)) map[sym] = list = new List<ShockersAnalyzer.DailyBar>();
+                list.Add(bar);
+            }
+            return map;
         }
 
         // ── low-level readers ────────────────────────────────────────────────
@@ -4157,7 +4627,7 @@ CONFIGURATION
   Example:
   {
     ""ScanHistoryDays"":     30,
-    ""MaxConcurrentFetches"": 2,
+    ""MaxConcurrentFetches"": 6,
     ""TopBuyCount"":         30,
     ""TopSellCount"":        20,
     ""DbPath"":              ""NseMomentumScanner.db"",
@@ -4171,12 +4641,31 @@ CONFIGURATION
     ""SlowTfCacheHours"":    6,
     ""MarketBenchmarkSymbol"": ""^NSEI"",
     ""ReferenceDataCsvPath"":  ""data/reference.csv"",
-    ""UseOptimizedWeights"":   true
+    ""UseOptimizedWeights"":   true,
+    ""ShockerTopCount"":        25,
+    ""ConsecutiveDailyMinStreak"":  3,
+    ""ConsecutiveWeeklyMinStreak"": 2
   }
-  See README.md for the full v4.0/v4.1 settings reference (market regime,
+  See README.md for the full v4.0/v4.1/v4.2 settings reference (market regime,
   relative strength, liquidity/extension gates, sector rotation, fundamental
-  screen, earnings blackout, and the weight-optimizer feedback loop).
+  screen, earnings blackout, the weight-optimizer feedback loop, and the
+  price/volume shockers + consecutive-mover dashboard panels).
 ");
+                return;
+            }
+
+            // ── Fail-fast config validation ──────────────────────────────────────
+            // Runs for every mode below (scan, --dry-run, --serve, --backtest,
+            // --optimize-weights) — a malformed appsettings.json should fail here with one
+            // clear message, not three layers deep as a confusing crash or a silent
+            // degenerate scan. --help intentionally skips this (see above) so a broken config
+            // file never blocks someone from just reading the usage text.
+            try { Config.Validate(); }
+            catch (Exception ex)
+            {
+                Log.Fatal(ex.Message);
+                await Log.CloseAndFlushAsync();
+                Environment.Exit(1);
                 return;
             }
 
