@@ -1,0 +1,21 @@
+2026-10-10 11:28:23 [INF] Dashboard working dir : D:\Dev\NSEMomentumScanner_v4_5
+2026-10-10 11:28:23 [INF] Dashboard DB path     : D:\Dev\NSEMomentumScanner_v4_5\NseMomentumScanner.db  (exists: true)
+2026-10-10 11:28:23 [INF] Dashboard DB sessions : 2
+2026-10-10 11:28:23 [INF] Dashboard live at   http://localhost:5080/
+2026-10-10 11:28:23 [INF] Live JSON API at    http://localhost:5080/dashboard_data.json
+2026-10-10 11:28:23 [INF] Chart data API at   http://localhost:5080/charts/{symbol} (e.g. /charts/RELIANCE.NS)
+2026-10-10 11:28:23 [INF] Health check at     http://localhost:5080/api/health
+2026-10-10 11:28:23 [INF] Backtesting page at http://localhost:5080/backtest
+2026-10-10 11:28:23 [INF] Press Ctrl+C to stop.
+2026-10-10 11:28:23 [INF] URL: http://localhost:5080/
+2026-10-10 12:55:35 [INF] Dashboard working dir : D:\Dev\NSEMomentumScanner_v4_5
+2026-10-10 12:55:35 [INF] Dashboard DB path     : D:\Dev\NSEMomentumScanner_v4_5\NseMomentumScanner.db  (exists: true)
+2026-10-10 12:55:35 [INF] Dashboard DB sessions : 1
+2026-10-10 12:55:35 [INF] Dashboard live at   http://localhost:5080/
+2026-10-10 12:55:35 [INF] Live JSON API at    http://localhost:5080/dashboard_data.json
+2026-10-10 12:55:35 [INF] Chart data API at   http://localhost:5080/charts/{symbol} (e.g. /charts/RELIANCE.NS)
+2026-10-10 12:55:35 [INF] Health check at     http://localhost:5080/api/health
+2026-10-10 12:55:35 [INF] Backtesting page at http://localhost:5080/backtest
+2026-10-10 12:55:35 [INF] Press Ctrl+C to stop.
+2026-10-10 12:55:35 [INF] URL: http://localhost:5080/
+2026-10-10 13:00:24 [WRN] Backtest dashboard API error: SQLite Error 8: 'attempt to write a readonly database'.

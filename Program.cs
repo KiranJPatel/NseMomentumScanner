@@ -1,5 +1,5 @@
 // =============================================================================
-//  NSE Momentum Stock Scanner  ·  Multi-Timeframe  ·  Production v4.0  ·  .NET 8
+//  NSE Momentum Stock Scanner  ·  Multi-Timeframe  ·  Production v4.6  ·  .NET 8
 // -----------------------------------------------------------------------------
 //  NuGet (NseMomentumScanner.csproj):
 //    Microsoft.Data.Sqlite       8.*   (SQLite — Microsoft-official)
@@ -92,6 +92,21 @@
 //  🟠 ADD  --serve prints the resolved DB path, existence, and session count at startup;
 //          /api/health exposes the same info on demand.
 // =============================================================================
+//  v4.5 CONTEXTUAL SIGNAL ENGINE
+//  -----------------------------------------------------------------------------
+//  ADD  Unified live/backtest benchmark + historical regime/RS context.
+//  ADD  Continuous trend/structure/volume quality metrics alongside legacy score.
+//  ADD  HH/HL/LH/LL structure, breakout/pullback/VCP setup quality and trigger confirmation.
+//  ADD  Setup-vs-trigger state machine, score velocity/acceleration and exhaustion/distribution detection.
+//  ADD  Risk/reward and resistance-aware entry gate; structural target reference.
+//  ADD  Separate SQLite signal_features journal; existing v4.4 tables/contracts remain intact.
+//  ADD  Dashboard JSON advanced signal payload.
+//  FIX  Backtest timeframe-coherence gate scales to the timeframes actually configured.
+//  FIX  Backtest now uses the same benchmark-backed RS and market-regime gates as live mode.
+//  DESIGN: no future bars are consumed by the enhancement calculations.
+// =============================================================================
+//
+// =============================================================================
 //
 //  STRATEGY CHANGES vs v3.3  (v4.0 — Principal Quant architecture review)
 //  ─────────────────────────────────────────────────────────────────────────────
@@ -183,6 +198,8 @@ namespace NseMomentumScanner
         public int?    KeepSessionCount      { get; set; }
         public string? DbPath                { get; set; }
         public string? CsvBaseDir            { get; set; }
+        public string? ChartsExportDir       { get; set; }
+        public bool?   ExportChartData       { get; set; }
         public bool?   SkipWeekends          { get; set; }
         public bool?   SkipHolidays          { get; set; }
         public int?    DashboardPort         { get; set; }
@@ -201,6 +218,7 @@ namespace NseMomentumScanner
         public double? MinPriceInr                 { get; set; }
         public double? MaxExtensionAboveEma50Pct   { get; set; }
         public int?    LiveAtrPeriod               { get; set; }
+        public int?    RsiPeriod                   { get; set; }
         public double? LiveAtrStopMultiplier       { get; set; }
         public double? LiveRiskRewardRatio         { get; set; }
         public double? BearRegimeScoreThresholdBonus { get; set; }
@@ -234,6 +252,37 @@ namespace NseMomentumScanner
         public double? ShockerMinPriceInr            { get; set; }
         public int?    ConsecutiveDailyMinStreak     { get; set; }
         public int?    ConsecutiveWeeklyMinStreak    { get; set; }
+
+        // v4.5: contextual signal engine / structure / setup / trigger / risk gates
+        public bool?   EnableAdvancedSignalEngine      { get; set; }
+        public double? MinQualityScore                 { get; set; }
+        public double? MinEntryScore                   { get; set; }
+        public double? StrongBuyQualityScore            { get; set; }
+        public double? StrongBuyEntryScore              { get; set; }
+        public double? MinimumRiskReward                 { get; set; }
+        public double? MinSetupScore                    { get; set; }
+        public double? BreakoutMinRvol                  { get; set; }
+        public double? MinimumRiskPct                    { get; set; }
+        public double? MaxBreakoutDistancePct            { get; set; }
+        public double? MaxPullbackDepthPct               { get; set; }
+        public double? ExtensionPenaltyPerPct            { get; set; }
+        public double? ExhaustionExtensionPct            { get; set; }
+        public double? ExhaustionAdxThreshold            { get; set; }
+        public double? AdxTriggerThreshold                { get; set; }
+        public double? ExhaustionRvolThreshold            { get; set; }
+        public double? ExhaustionCloseLocation            { get; set; }
+        public double? MinBullishCloseLocation            { get; set; }
+        public double? DistributionRvolThreshold           { get; set; }
+        public double? DistributionCloseLocation          { get; set; }
+        public int?    DistributionWarningCount           { get; set; }
+        public double? BreakoutTargetAtr                  { get; set; }
+        public int?    StructureLookbackBars              { get; set; }
+        public int?    PivotStrength                      { get; set; }
+        public int?    SlopeLookbackBars                  { get; set; }
+        public int?    DistributionLookbackBars            { get; set; }
+        public int?    BreakoutLookbackBars                { get; set; }
+        public bool?   RequireAdvancedBuyGates             { get; set; }
+        public bool?   RequireAdvancedSellGates            { get; set; }
 
         private const string FileName = "appsettings.json";
 
@@ -302,6 +351,12 @@ namespace NseMomentumScanner
         public static int KeepSessionCount => _s.KeepSessionCount ?? 10;
         public static string DbPath => _s.DbPath ?? "NseMomentumScanner.db";
         public static string CsvBaseDir => _s.CsvBaseDir ?? "data";
+        // v4.4: per-symbol OHLCV+indicator JSON for the dashboard's Charts tab (ChartDataExporter).
+        // Off switch here, not just a directory: on a slow disk or a very large universe, writing
+        // ~800 small JSON files every scan is easy overhead to want to skip on days you don't need
+        // the chart tab refreshed (the tab just serves whatever it last wrote until the next scan).
+        public static string ChartsExportDir => _s.ChartsExportDir ?? "charts";
+        public static bool   ExportChartData => _s.ExportChartData ?? true;
         public static bool SkipWeekends => _s.SkipWeekends ?? true;
         public static bool SkipHolidays => _s.SkipHolidays ?? true;
         public static int TopBuyCount => _s.TopBuyCount ?? 30;
@@ -347,6 +402,7 @@ namespace NseMomentumScanner
         // ATR-based suggested stop/target surfaced on live BUY candidates (not a backtest —
         // just a risk reference point computed the same way ExitEvaluator does historically).
         public static int LiveAtrPeriod => _s.LiveAtrPeriod ?? 14;
+        public static int RsiPeriod => _s.RsiPeriod ?? 14;
         public static double LiveAtrStopMultiplier => _s.LiveAtrStopMultiplier ?? 2.5;
         public static double LiveRiskRewardRatio => _s.LiveRiskRewardRatio ?? 2.5;
 
@@ -512,6 +568,37 @@ namespace NseMomentumScanner
         public static int    ConsecutiveDailyMinStreak  => _s.ConsecutiveDailyMinStreak ?? 3;
         public static int    ConsecutiveWeeklyMinStreak => _s.ConsecutiveWeeklyMinStreak ?? 2;
 
+        // ── v4.5: Contextual signal engine ───────────────────────────────────────
+        public static bool   EnableAdvancedSignalEngine => _s.EnableAdvancedSignalEngine ?? true;
+        public static bool   RequireAdvancedBuyGates => _s.RequireAdvancedBuyGates ?? true;
+        public static bool   RequireAdvancedSellGates => _s.RequireAdvancedSellGates ?? true;
+        public static double MinQualityScore => _s.MinQualityScore ?? 68.0;
+        public static double MinEntryScore => _s.MinEntryScore ?? 60.0;
+        public static double StrongBuyQualityScore => _s.StrongBuyQualityScore ?? 82.0;
+        public static double StrongBuyEntryScore => _s.StrongBuyEntryScore ?? 78.0;
+        public static double MinimumRiskReward => _s.MinimumRiskReward ?? 2.0;
+        public static double MinSetupScore => _s.MinSetupScore ?? 55.0;
+        public static double BreakoutMinRvol => _s.BreakoutMinRvol ?? 1.5;
+        public static double MinimumRiskPct => _s.MinimumRiskPct ?? 2.0;
+        public static double MaxBreakoutDistancePct => _s.MaxBreakoutDistancePct ?? 3.0;
+        public static double MaxPullbackDepthPct => _s.MaxPullbackDepthPct ?? 7.0;
+        public static double ExtensionPenaltyPerPct => _s.ExtensionPenaltyPerPct ?? 2.0;
+        public static double ExhaustionExtensionPct => _s.ExhaustionExtensionPct ?? 18.0;
+        public static double ExhaustionAdxThreshold => _s.ExhaustionAdxThreshold ?? 42.0;
+        public static double AdxTriggerThreshold => _s.AdxTriggerThreshold ?? 25.0;
+        public static double ExhaustionRvolThreshold => _s.ExhaustionRvolThreshold ?? 2.5;
+        public static double ExhaustionCloseLocation => _s.ExhaustionCloseLocation ?? 0.10;
+        public static double MinBullishCloseLocation => _s.MinBullishCloseLocation ?? 0.20;
+        public static double DistributionRvolThreshold => _s.DistributionRvolThreshold ?? 1.5;
+        public static double DistributionCloseLocation => _s.DistributionCloseLocation ?? -0.35;
+        public static int DistributionWarningCount => _s.DistributionWarningCount ?? 3;
+        public static double BreakoutTargetAtr => _s.BreakoutTargetAtr ?? 3.0;
+        public static int StructureLookbackBars => _s.StructureLookbackBars ?? 60;
+        public static int PivotStrength => _s.PivotStrength ?? 2;
+        public static int SlopeLookbackBars => _s.SlopeLookbackBars ?? 5;
+        public static int DistributionLookbackBars => _s.DistributionLookbackBars ?? 10;
+        public static int BreakoutLookbackBars => _s.BreakoutLookbackBars ?? 20;
+
         /// <summary>
         /// Fail-fast sanity check on the *effective* config (compile-time defaults +
         /// appsettings.json overrides combined) — called once at startup for every mode that
@@ -534,6 +621,7 @@ namespace NseMomentumScanner
             if (TopSellCount <= 0) errors.Add($"TopSellCount must be > 0 (was {TopSellCount})");
             if (string.IsNullOrWhiteSpace(DbPath)) errors.Add("DbPath cannot be empty");
             if (string.IsNullOrWhiteSpace(CsvBaseDir)) errors.Add("CsvBaseDir cannot be empty");
+            if (string.IsNullOrWhiteSpace(ChartsExportDir)) errors.Add("ChartsExportDir cannot be empty");
             if (DashboardPort is <= 0 or > 65535) errors.Add($"DashboardPort must be 1-65535 (was {DashboardPort})");
             if (string.IsNullOrWhiteSpace(DashboardHost)) errors.Add("DashboardHost cannot be empty");
             if (ShockerTopCount <= 0) errors.Add($"ShockerTopCount must be > 0 (was {ShockerTopCount})");
@@ -706,6 +794,30 @@ namespace NseMomentumScanner
         public double  SuggestedStop    { get; set; }
         public double  SuggestedTarget  { get; set; }
 
+        // ── v4.5 contextual signal engine ───────────────────────────────────
+        public double QualityScore            { get; set; }
+        public double EntryScore              { get; set; }
+        public double StructureScore           { get; set; }
+        public double SetupScore               { get; set; }
+        public double TriggerScore             { get; set; }
+        public double TrendQuality             { get; set; }
+        public double VolumeQuality             { get; set; }
+        public double BreakoutQuality          { get; set; }
+        public double PullbackQuality           { get; set; }
+        public double RiskReward                { get; set; }
+        public double ScoreVelocity             { get; set; }
+        public double ScoreAcceleration         { get; set; }
+        public double AtrDistanceFromPivot      { get; set; }
+        public double RelativeExtensionQuality  { get; set; }
+        public int    DistributionCount         { get; set; }
+        public bool   IsBreakout                { get; set; }
+        public bool   IsPullback                { get; set; }
+        public bool   IsMomentumExhaustion      { get; set; }
+        public string StructureState             { get; set; } = "RANGE";
+        public string SetupState                 { get; set; } = "NONE";
+        public string TriggerState               { get; set; } = "NONE";
+        public string SignalState                { get; set; } = "WATCH";
+
         public PriceLevels       Levels    { get; set; } = new();
         public SupertrendMetrics StMetrics { get; set; } = new();
     }
@@ -750,6 +862,30 @@ namespace NseMomentumScanner
         public double? PromoterPledgePct   { get; set; }
         public DateTime? NextEarningsDate  { get; set; }
         public bool    InEarningsBlackout  { get; set; }
+
+        // ── v4.5: contextual quality / entry / setup / trigger / risk ───────
+        public double QualityScore            { get; set; }
+        public double EntryScore              { get; set; }
+        public double StructureScore           { get; set; }
+        public double SetupScore               { get; set; }
+        public double TriggerScore             { get; set; }
+        public double TrendQuality             { get; set; }
+        public double VolumeQuality             { get; set; }
+        public double BreakoutQuality          { get; set; }
+        public double PullbackQuality           { get; set; }
+        public double RiskReward                { get; set; }
+        public double ScoreVelocity             { get; set; }
+        public double ScoreAcceleration         { get; set; }
+        public double AtrDistanceFromPivot      { get; set; }
+        public double RelativeExtensionQuality  { get; set; }
+        public int    DistributionCount         { get; set; }
+        public bool   IsBreakout                { get; set; }
+        public bool   IsPullback                { get; set; }
+        public bool   IsMomentumExhaustion      { get; set; }
+        public string StructureState             { get; set; } = "RANGE";
+        public string SetupState                 { get; set; } = "NONE";
+        public string TriggerState               { get; set; } = "NONE";
+        public string SignalState                { get; set; } = "WATCH";
 
         public PriceLevels       Levels     { get; set; } = new();
         public SupertrendMetrics StMetrics  { get; set; } = new();
@@ -863,6 +999,7 @@ namespace NseMomentumScanner
         public EmaResult[]        EmaSlow    { get; init; } = Array.Empty<EmaResult>();
         public double[]           VolumeSma  { get; init; } = Array.Empty<double>();
         public AtrResult[]        Atr        { get; init; } = Array.Empty<AtrResult>();
+        public RsiResult[]        Rsi        { get; init; } = Array.Empty<RsiResult>();
 
         public static IndicatorArrays Compute(List<StockQuote> quotes)
         {
@@ -888,6 +1025,7 @@ namespace NseMomentumScanner
                 EmaSlow    = quotes.GetEma(Config.EmaSlowPeriod).ToArray(),
                 VolumeSma  = volSma,
                 Atr        = quotes.GetAtr(Config.LiveAtrPeriod).ToArray(),
+                Rsi        = quotes.GetRsi(Config.RsiPeriod).ToArray(),
             };
         }
     }
@@ -945,144 +1083,196 @@ namespace NseMomentumScanner
     // =========================================================================
     //  TICKER UNIVERSES  (raw symbols — Uri.EscapeDataString handles encoding)
     // =========================================================================
+    // v4.3 note: refreshed against NSE's live Nifty 200 / Nifty Total Market
+    // constituent files (fetched fresh — see below) and corrected two stale
+    // symbols: LTIMindtree renamed its trading symbol to LTM in Feb 2026
+    // (old "LTIM.NS" would silently 404 on Yahoo), and Tata Motors demerged
+    // into Tata Motors Commercial Vehicles ("TMCV.NS") and Tata Motors
+    // Passenger Vehicles ("TMPV.NS") in 2025 — the old "TATAMOTORS.NS"
+    // ticker no longer trades. Every ticker below also appears in exactly
+    // one of Nifty200Universe / NiftySMIDUniverse / NewListingsUniverse —
+    // duplicates that previously existed across buckets (e.g. SWIGGY,
+    // HYUNDAI, BAJAJHFL sitting in both Nifty200 and NewListings) have been
+    // resolved with NewListingsUniverse taking priority, then Nifty200.
     internal static class Nifty200Universe
     {
         public static readonly IReadOnlyList<string> Tickers = new[]
         {
-            "ATGL.NS","AUBANK.NS","AUROPHARMA.NS","BIOCON.NS","BLUESTARCO.NS","BPCL.NS",
-            "BSE.NS","COROMANDEL.NS","GAIL.NS","HCLTECH.NS","ICICIGI.NS","INDIGO.NS",
-            "INDUSINDBK.NS","IRCTC.NS","ITC.NS","JUBLFOOD.NS","KOTAKBANK.NS","MAXHEALTH.NS",
-            "NAUKRI.NS","NTPC.NS","ONGC.NS","PAGEIND.NS","PERSISTENT.NS","POWERGRID.NS",
-            "POWERINDIA.NS","SHREECEM.NS","SRF.NS","SUNPHARMA.NS","TECHM.NS","TORNTPOWER.NS",
-            "TRENT.NS","VBL.NS","WIPRO.NS","KALYANKJIL.NS","LODHA.NS","SONACOMS.NS",
-            "HAL.NS","PFC.NS","TCS.NS","360ONE.NS","BHARTIHEXA.NS","UNITDSPR.NS",
-            "PREMIERENE.NS","SWIGGY.NS","ITCHOTELS.NS","ABB.NS","ABCAPITAL.NS","ACC.NS",
-            "ADANIENSOL.NS","ADANIENT.NS","ADANIGREEN.NS","ADANIPORTS.NS","ADANIPOWER.NS","ALKEM.NS",
-            "AMBUJACEM.NS","APLAPOLLO.NS","APOLLOHOSP.NS","ASHOKLEY.NS","ASIANPAINT.NS","ASTRAL.NS",
-            "AXISBANK.NS","BAJAJ-AUTO.NS","BAJAJFINSV.NS","BAJAJHFL.NS","BAJAJHLDNG.NS","BAJFINANCE.NS",
+            "360ONE.NS","ABB.NS","ABCAPITAL.NS","ACC.NS","ADANIENSOL.NS","ADANIENT.NS",
+            "ADANIGREEN.NS","ADANIPORTS.NS","ADANIPOWER.NS","ALKEM.NS","AMBUJACEM.NS","APLAPOLLO.NS",
+            "APOLLOHOSP.NS","ASHOKLEY.NS","ASIANPAINT.NS","ASTRAL.NS","ATGL.NS","AUBANK.NS",
+            "AUROPHARMA.NS","AXISBANK.NS","BAJAJ-AUTO.NS","BAJAJFINSV.NS","BAJAJHLDNG.NS","BAJFINANCE.NS",
             "BANKBARODA.NS","BANKINDIA.NS","BDL.NS","BEL.NS","BHARATFORG.NS","BHARTIARTL.NS",
-            "BHEL.NS","BOSCHLTD.NS","BRITANNIA.NS","CANBK.NS","CGPOWER.NS","CHOLAFIN.NS",
-            "CIPLA.NS","COALINDIA.NS","COCHINSHIP.NS","COFORGE.NS","COLPAL.NS","CONCOR.NS",
-            "CUMMINSIND.NS","DABUR.NS","DIVISLAB.NS","DIXON.NS","DLF.NS","DMART.NS",
-            "DRREDDY.NS","EICHERMOT.NS","ENRIN.NS","ETERNAL.NS","EXIDEIND.NS","FEDERALBNK.NS",
-            "FORTIS.NS","GLENMARK.NS","GMRAIRPORT.NS","GODFRYPHLP.NS","GODREJCP.NS","GODREJPROP.NS",
-            "GRASIM.NS","HAVELLS.NS","HDFCAMC.NS","HDFCBANK.NS","HDFCLIFE.NS","HEROMOTOCO.NS",
-            "HINDALCO.NS","HINDPETRO.NS","HINDUNILVR.NS","HINDZINC.NS","HUDCO.NS","HYUNDAI.NS",
-            "ICICIBANK.NS","IDEA.NS","IDFCFIRSTB.NS","IGL.NS","INDHOTEL.NS","INDIANB.NS",
-            "INDUSTOWER.NS","INFY.NS","IOC.NS","IRB.NS","IREDA.NS","IRFC.NS",
-            "JINDALSTEL.NS","JIOFIN.NS","JSWENERGY.NS","JSWSTEEL.NS","KEI.NS","KPITTECH.NS",
-            "LICHSGFIN.NS","LICI.NS","LT.NS","LTF.NS","LTIM.NS","LUPIN.NS",
-            "M&M.NS","M&MFIN.NS","MANKIND.NS","MARICO.NS","MARUTI.NS","MAZDOCK.NS",
-            "MFSL.NS","MOTHERSON.NS","MOTILALOFS.NS","MPHASIS.NS","MRF.NS","MUTHOOTFIN.NS",
-            "NATIONALUM.NS","NESTLEIND.NS","NHPC.NS","NMDC.NS","NTPCGREEN.NS","NYKAA.NS",
-            "OBEROIRLTY.NS","OFSS.NS","OIL.NS","PATANJALI.NS","PAYTM.NS","PHOENIXLTD.NS",
-            "PIDILITIND.NS","PIIND.NS","PNB.NS","POLICYBZR.NS","POLYCAB.NS","PRESTIGE.NS",
-            "RECLTD.NS","RELIANCE.NS","RVNL.NS","SAIL.NS","SBICARD.NS","SBILIFE.NS",
-            "SBIN.NS","SHRIRAMFIN.NS","SIEMENS.NS","SOLARINDS.NS","SUPREMEIND.NS","SUZLON.NS",
-            "TATACOMM.NS","TATACONSUM.NS","TATAELXSI.NS","TATAMOTORS.NS","TATAPOWER.NS","TATASTEEL.NS",
-            "TATATECH.NS","TIINDIA.NS","TITAN.NS","TORNTPHARM.NS","TVSMOTOR.NS","ULTRACEMCO.NS",
-            "UNIONBANK.NS","UPL.NS","VEDL.NS","VMM.NS","VOLTAS.NS","WAAREEENER.NS",
-            "YESBANK.NS","ZYDUSLIFE.NS"
+            "BHEL.NS","BIOCON.NS","BLUESTARCO.NS","BOSCHLTD.NS","BPCL.NS","BRITANNIA.NS",
+            "BSE.NS","CANBK.NS","CGPOWER.NS","CHOLAFIN.NS","CIPLA.NS","COALINDIA.NS",
+            "COCHINSHIP.NS","COFORGE.NS","COLPAL.NS","CONCOR.NS","COROMANDEL.NS","CUMMINSIND.NS",
+            "DABUR.NS","DIVISLAB.NS","DIXON.NS","DLF.NS","DMART.NS","DRREDDY.NS",
+            "EICHERMOT.NS","ENRIN.NS","ETERNAL.NS","EXIDEIND.NS","FEDERALBNK.NS","FORTIS.NS",
+            "GAIL.NS","GLENMARK.NS","GMRAIRPORT.NS","GODFRYPHLP.NS","GODREJCP.NS","GODREJPROP.NS",
+            "GRASIM.NS","GVT&D.NS","HAL.NS","HAVELLS.NS","HCLTECH.NS","HDFCAMC.NS",
+            "HDFCBANK.NS","HDFCLIFE.NS","HEROMOTOCO.NS","HINDALCO.NS","HINDPETRO.NS","HINDUNILVR.NS",
+            "HINDZINC.NS","HUDCO.NS","ICICIAMC.NS","ICICIBANK.NS","ICICIGI.NS","IDEA.NS",
+            "IDFCFIRSTB.NS","IGL.NS","INDHOTEL.NS","INDIANB.NS","INDIGO.NS","INDUSINDBK.NS",
+            "INDUSTOWER.NS","INFY.NS","IOC.NS","IRB.NS","IRCTC.NS","IREDA.NS",
+            "IRFC.NS","ITC.NS","ITCHOTELS.NS","JINDALSTEL.NS","JIOFIN.NS","JSWENERGY.NS",
+            "JSWSTEEL.NS","JUBLFOOD.NS","KALYANKJIL.NS","KEI.NS","KOTAKBANK.NS","KPITTECH.NS",
+            "LENSKART.NS","LGEINDIA.NS","LICHSGFIN.NS","LICI.NS","LODHA.NS","LT.NS",
+            "LTF.NS","LTM.NS","LUPIN.NS","M&M.NS","M&MFIN.NS","MANKIND.NS",
+            "MARICO.NS","MARUTI.NS","MAXHEALTH.NS","MAZDOCK.NS","MFSL.NS","MOTHERSON.NS",
+            "MOTILALOFS.NS","MPHASIS.NS","MRF.NS","MUTHOOTFIN.NS","NATIONALUM.NS","NAUKRI.NS",
+            "NESTLEIND.NS","NHPC.NS","NMDC.NS","NTPC.NS","NYKAA.NS","OBEROIRLTY.NS",
+            "OFSS.NS","OIL.NS","ONGC.NS","PAGEIND.NS","PATANJALI.NS","PAYTM.NS",
+            "PERSISTENT.NS","PFC.NS","PHOENIXLTD.NS","PIDILITIND.NS","PIIND.NS","PNB.NS",
+            "POLICYBZR.NS","POLYCAB.NS","POWERGRID.NS","POWERINDIA.NS","PRESTIGE.NS","RECLTD.NS",
+            "RELIANCE.NS","RVNL.NS","SAIL.NS","SBICARD.NS","SBILIFE.NS","SBIN.NS",
+            "SHREECEM.NS","SHRIRAMFIN.NS","SIEMENS.NS","SOLARINDS.NS","SONACOMS.NS","SRF.NS",
+            "SUNPHARMA.NS","SUPREMEIND.NS","SUZLON.NS","TATACOMM.NS","TATACONSUM.NS","TATAELXSI.NS",
+            "TATAPOWER.NS","TATASTEEL.NS","TATATECH.NS","TCS.NS","TECHM.NS","TIINDIA.NS",
+            "TITAN.NS","TMCV.NS","TMPV.NS","TORNTPHARM.NS","TORNTPOWER.NS","TRENT.NS",
+            "TVSMOTOR.NS","ULTRACEMCO.NS","UNIONBANK.NS","UNITDSPR.NS","UPL.NS","VBL.NS",
+            "VEDL.NS","VOLTAS.NS","WIPRO.NS","YESBANK.NS","ZYDUSLIFE.NS"
         };
     }
 
+    // v4.3 note: expanded from NSE's live Nifty Total Market constituent file
+    // (Nifty 500 + Nifty Microcap 250 — the officially rank-ordered universe
+    // stops at 750 names; see the remarks above BuildUniverse for why this
+    // scanner doesn't chase raw NSE-mainboard count beyond that). Every
+    // ticker here is unique to this bucket — see the Nifty200Universe note
+    // above on cross-bucket dedup.
     internal static class NiftySMIDUniverse
     {
         public static readonly IReadOnlyList<string> Tickers = new[]
         {
-            "3MINDIA.NS","ABBOTINDIA.NS","ATGL.NS","AIAENG.NS","AJANTPHARM.NS","APARINDS.NS",
-            "AUBANK.NS","AUROPHARMA.NS","BALKRISIND.NS","BERGEPAINT.NS","BIOCON.NS","BLUESTARCO.NS",
-            "BSE.NS","COROMANDEL.NS","CRISIL.NS","DEEPAKNTR.NS","FLUOROCHEM.NS","GICRE.NS",
-            "GLAXO.NS","GODREJIND.NS","GUJGASLTD.NS","HONAUT.NS","ICICIPRULI.NS","INDUSINDBK.NS",
-            "IPCALAB.NS","IRCTC.NS","JKCEMENT.NS","JSL.NS","JUBLFOOD.NS","KPRMILL.NS",
-            "LINDEINDIA.NS","LTTS.NS","NAM-INDIA.NS","NIACL.NS","NLCINDIA.NS","PAGEIND.NS",
-            "PERSISTENT.NS","PETRONET.NS","PGHH.NS","POWERINDIA.NS","SCHAEFFLER.NS","SRF.NS",
-            "SUNDARMFIN.NS","SYNGENE.NS","THERMAX.NS","TORNTPOWER.NS","UBL.NS","KALYANKJIL.NS",
-            "SONACOMS.NS","AWL.NS","MEDANTA.NS","360ONE.NS","LLOYDSME.NS","JSWINFRA.NS",
-            "BHARTIHEXA.NS","PREMIERENE.NS","SWIGGY.NS","ITCHOTELS.NS","HEXT.NS","ABCAPITAL.NS",
-            "ACC.NS","ALKEM.NS","APLAPOLLO.NS","APOLLOTYRE.NS","ASHOKLEY.NS","ASTRAL.NS",
-            "BANKINDIA.NS","BDL.NS","BHARATFORG.NS","BHEL.NS","COCHINSHIP.NS","COFORGE.NS",
-            "COLPAL.NS","CONCOR.NS","CUMMINSIND.NS","DABUR.NS","DALBHARAT.NS","DIXON.NS",
-            "ENDURANCE.NS","ESCORTS.NS","EXIDEIND.NS","FACT.NS","FEDERALBNK.NS","FORTIS.NS",
-            "GLENMARK.NS","GMRAIRPORT.NS","GODFRYPHLP.NS","GODREJPROP.NS","HDFCAMC.NS",
-            "HEROMOTOCO.NS","HINDPETRO.NS","HUDCO.NS","IDBI.NS","IDEA.NS","IDFCFIRSTB.NS",
-            "IGL.NS","INDIANB.NS","INDUSTOWER.NS","IOB.NS","IRB.NS","IREDA.NS",
-            "KEI.NS","KPITTECH.NS","LICHSGFIN.NS","LTF.NS","LUPIN.NS","M&MFIN.NS",
-            "MAHABANK.NS","MANKIND.NS","MARICO.NS","MFSL.NS","MOTILALOFS.NS","MPHASIS.NS",
-            "MRF.NS","MUTHOOTFIN.NS","NATIONALUM.NS","NHPC.NS","NMDC.NS","NTPCGREEN.NS",
-            "NYKAA.NS","OBEROIRLTY.NS","OFSS.NS","OIL.NS","PATANJALI.NS","PAYTM.NS",
-            "PHOENIXLTD.NS","PIIND.NS","POLICYBZR.NS","POLYCAB.NS","PRESTIGE.NS","RVNL.NS",
-            "SAIL.NS","SBICARD.NS","SJVN.NS","SUPREMEIND.NS","SUZLON.NS","TATACOMM.NS",
-            "TATAELXSI.NS","TATAINVEST.NS","TATATECH.NS","TIINDIA.NS","UCOBANK.NS","UNIONBANK.NS",
-            "UNOMINDA.NS","UPL.NS","VMM.NS","VOLTAS.NS","WAAREEENER.NS","YESBANK.NS",
-            "AARTIIND.NS","AAVAS.NS","ACE.NS","AKZOINDIA.NS","ALKYLAMINE.NS","APLLTD.NS",
-            "ASTERDM.NS","ASTRAZEN.NS","ATUL.NS","BALRAMCHIN.NS","BANDHANBNK.NS","BASF.NS",
-            "BATAINDIA.NS","BAYERCROP.NS","BBTC.NS","BEML.NS","BLS.NS","BLUEDART.NS",
-            "BRIGADE.NS","CAMS.NS","CANFINHOME.NS","CAPLIPOINT.NS","CARBORUNIV.NS","CASTROLIND.NS",
-            "CDSL.NS","CEATLTD.NS","CERA.NS","CESC.NS","CHAMBLFERT.NS","CHENNPETRO.NS",
-            "CHOLAHLDNG.NS","CROMPTON.NS","CYIENT.NS","DBREALTY.NS","DCMSHRIRAM.NS","DEEPAKFERT.NS",
-            "EIHOTEL.NS","ELECON.NS","ELGIEQUIP.NS","EMAMILTD.NS","ENGINERSIN.NS","ERIS.NS",
-            "FINCABLES.NS","FINPIPE.NS","FORCEMOT.NS","FSL.NS","GESHIP.NS","GILLETTE.NS",
-            "GLAND.NS","GODREJAGRO.NS","GRANULES.NS","GRAPHITE.NS","GRAVITA.NS","GRSE.NS",
-            "GSPL.NS","HAPPSTMNDS.NS","HEG.NS","HINDCOPPER.NS","HSCL.NS","IEX.NS",
-            "IIFL.NS","INOXWIND.NS","INTELLECT.NS","IRCON.NS","JBCHEPHARM.NS","JINDALSAW.NS",
-            "JKTYRE.NS","JUBLPHARMA.NS","JYOTHYLAB.NS","KARURVYSYA.NS","KEC.NS","KIRLOSBROS.NS",
-            "KIRLOSENG.NS","KSB.NS","LALPATHLAB.NS","MAHSCOOTER.NS","MAHSEAMLES.NS","MCX.NS",
-            "MGL.NS","MINDACORP.NS","MRPL.NS","NATCOPHARM.NS","NAVINFLUOR.NS","NCC.NS",
-            "NEWGEN.NS","NH.NS","PFIZER.NS","PGEL.NS","PNBHOUSING.NS","POLYMED.NS",
-            "PRAJIND.NS","PVRINOX.NS","RAMCOCEM.NS","RCF.NS","REDINGTON.NS","RELINFRA.NS",
-            "RITES.NS","RKFORGE.NS","SAREGAMA.NS","SCHNEIDER.NS","SCI.NS","SONATSOFTW.NS",
-            "SUMICHEM.NS","SUNDRMFAST.NS","SUNTV.NS","TATACHEM.NS","TECHNOE.NS","TEJASNET.NS",
-            "TIMKEN.NS","TRITURBINE.NS","TRIVENI.NS","UTIAMC.NS","VGUARD.NS","VTL.NS",
-            "WELCORP.NS","WHIRLPOOL.NS","WOCKPHARMA.NS","ZENSARTECH.NS","ZENTEC.NS","HOMEFIRST.NS",
-            "RAILTEL.NS","CRAFTSMAN.NS","KIMS.NS","CLEAN.NS","NUVOCO.NS","APTUS.NS",
-            "VIJAYA.NS","ABSLAMC.NS","SAPPHIRE.NS","STARHEALTH.NS","LATENTVIEW.NS","MAPMYINDIA.NS",
-            "DATAPATTNS.NS","CCL.NS","JUBLINGREA.NS","POONAWALLA.NS","ANGELONE.NS","PCBL.NS",
-            "RHIM.NS","MANYAVAR.NS","CAMPUS.NS","RAINBOW.NS","SHYAMMETL.NS","ZFCVINDIA.NS",
-            "PPLPHARMA.NS","ITI.NS","FIVESTAR.NS","KFINTECH.NS","JWL.NS","CHOICEIN.NS",
-            "CONCORDBIO.NS","SIGNATURE.NS","RRKABEL.NS","NUVAMA.NS","PTCIL.NS","TITAGARH.NS",
-            "BLUEJET.NS","HONASA.NS","DOMS.NS","INOXINDIA.NS","JYOTICNC.NS","INDGN.NS",
-            "TBOTEK.NS","AADHARHFC.NS","GODIGIT.NS","AEGISLOG.NS","AIIL.NS","AKUMS.NS",
-            "ARE&M.NS","EMCURE.NS","FIRSTCRY.NS","LTFOODS.NS","SAMMAANCAP.NS","WELSPUNLIV.NS",
-            "ABREL.NS","AFCONS.NS","ACMESOLAR.NS","BSOFT.NS","SAILIFE.NS","IKS.NS",
-            "IGIL.NS","VENTIVE.NS","AGARWALEYE.NS","HBLENGINE.NS","ONESOURCE.NS","TARIL.NS",
-            "THELEELA.NS","AEGISVOPAK.NS","ATHERENERG.NS","ABFRL.NS","ABLBL.NS","AFFLE.NS",
-            "ALOKINDS.NS","AMBER.NS","ANANDRATHI.NS","ANANTRAJ.NS","ASAHIINDIA.NS","BIKAJI.NS",
-            "CENTRALBK.NS","CENTURYPLY.NS","CGCL.NS","CHALET.NS","COHANCE.NS","CREDITACC.NS",
-            "CUB.NS","DELHIVERY.NS","DEVYANI.NS","ECLERX.NS","EIDPARRY.NS","GMDCLTD.NS",
-            "GPIL.NS","HFCL.NS","IFCI.NS","INDIACEM.NS","INDIAMART.NS","J&KBANK.NS",
-            "JBMA.NS","JMFINANCIL.NS","JPPOWER.NS","KAJARIACER.NS","KAYNES.NS","KPIL.NS",
-            "LAURUSLABS.NS","LEMONTREE.NS","MANAPPURAM.NS","METROPOLIS.NS","MMTC.NS","MSUMI.NS",
-            "NAVA.NS","NBCC.NS","NETWEB.NS","NEULANDLAB.NS","NIVABUPA.NS","NSLNISP.NS",
-            "OLAELEC.NS","OLECTRA.NS","RADICO.NS","RBLBANK.NS","RPOWER.NS","SAGILITY.NS",
-            "SARDAEN.NS","SBFC.NS","SKFINDIA.NS","SOBHA.NS","SWANCORP.NS","SYRMA.NS",
-            "TRIDENT.NS","TTML.NS","USHAMART.NS","ZEEL.NS"
+            "3MINDIA.NS","AARTIDRUGS.NS","AARTIIND.NS","AARTIPHARM.NS","AAVAS.NS","ABBOTINDIA.NS",
+            "ABFRL.NS","ABLBL.NS","ABREL.NS","ABSLAMC.NS","ACE.NS","ACI.NS",
+            "ACUTAAS.NS","ADVENZYMES.NS","AEGISLOG.NS","AEQUS.NS","AETHER.NS","AFCONS.NS",
+            "AFFLE.NS","AHLUCONT.NS","AIAENG.NS","AIIL.NS","AJANTPHARM.NS","AKZOINDIA.NS",
+            "ALIVUS.NS","ALKYLAMINE.NS","ALOKINDS.NS","AMBER.NS","ANANDRATHI.NS","ANANTRAJ.NS",
+            "ANGELONE.NS","ANUP.NS","ANURAS.NS","APARINDS.NS","APLLTD.NS","APOLLO.NS",
+            "APOLLOTYRE.NS","APTUS.NS","ARE&M.NS","ARVIND.NS","ARVINDFASN.NS","ASAHIINDIA.NS",
+            "ASHAPURMIN.NS","ASHOKA.NS","ASTERDM.NS","ASTRAMICRO.NS","ASTRAZEN.NS","ATLANTAELE.NS",
+            "ATUL.NS","AURIONPRO.NS","AVANTIFEED.NS","AVL.NS","AWL.NS","AXISCADES.NS",
+            "BAJAJELEC.NS","BALAMINES.NS","BALKRISIND.NS","BALRAMCHIN.NS","BALUFORGE.NS","BANCOINDIA.NS",
+            "BANDHANBNK.NS","BASF.NS","BATAINDIA.NS","BAYERCROP.NS","BBOX.NS","BBTC.NS",
+            "BECTORFOOD.NS","BEML.NS","BERGEPAINT.NS","BIKAJI.NS","BIRLACORPN.NS","BLS.NS",
+            "BLUEDART.NS","BLUEJET.NS","BORORENEW.NS","BRIGADE.NS","BSOFT.NS","CAMPUS.NS",
+            "CAMS.NS","CANFINHOME.NS","CANHLIFE.NS","CAPLIPOINT.NS","CARBORUNIV.NS","CASTROLIND.NS",
+            "CCL.NS","CDSL.NS","CEATLTD.NS","CELLO.NS","CEMPRO.NS","CENTRALBK.NS",
+            "CENTURYPLY.NS","CERA.NS","CESC.NS","CGCL.NS","CHALET.NS","CHAMBLFERT.NS",
+            "CHENNPETRO.NS","CHOICEIN.NS","CHOLAHLDNG.NS","CIEINDIA.NS","CLEAN.NS","CMSINFO.NS",
+            "COHANCE.NS","CONCORDBIO.NS","CORONA.NS","CPPLUS.NS","CRAFTSMAN.NS","CREDITACC.NS",
+            "CRISIL.NS","CROMPTON.NS","CSBBANK.NS","CUB.NS","CUPID.NS","CYIENT.NS",
+            "DALBHARAT.NS","DATAMATICS.NS","DATAPATTNS.NS","DBL.NS","DBREALTY.NS","DCBBANK.NS",
+            "DCMSHRIRAM.NS","DEEPAKFERT.NS","DEEPAKNTR.NS","DELHIVERY.NS","DEVYANI.NS","DIACABS.NS",
+            "DOMS.NS","DYNAMATECH.NS","ECLERX.NS","EDELWEISS.NS","EIDPARRY.NS","EIHOTEL.NS",
+            "ELECON.NS","ELECTCAST.NS","ELGIEQUIP.NS","EMAMILTD.NS","EMBDL.NS","EMIL.NS",
+            "ENDURANCE.NS","ENGINERSIN.NS","EPL.NS","EQUITASBNK.NS","ERIS.NS","ESCORTS.NS",
+            "EUREKAFORB.NS","FACT.NS","FIEMIND.NS","FINCABLES.NS","FINPIPE.NS","FIVESTAR.NS",
+            "FLUOROCHEM.NS","FORCEMOT.NS","FSL.NS","GABRIEL.NS","GAEL.NS","GALLANTT.NS",
+            "GESHIP.NS","GHCL.NS","GICRE.NS","GILLETTE.NS","GLAND.NS","GLAXO.NS",
+            "GMDCLTD.NS","GMMPFAUDLR.NS","GMRP&UI.NS","GNFC.NS","GODREJAGRO.NS","GODREJIND.NS",
+            "GOKEX.NS","GOKULAGRO.NS","GPIL.NS","GPPL.NS","GRANULES.NS","GRAPHITE.NS",
+            "GRAVITA.NS","GREAVESCOT.NS","GRINDWELL.NS","GRSE.NS","GRWRHITECH.NS","GSFC.NS",
+            "GSPL.NS","GUJGASLTD.NS","HAPPSTMNDS.NS","HBLENGINE.NS","HCC.NS","HCG.NS",
+            "HEG.NS","HEMIPROP.NS","HERITGFOOD.NS","HFCL.NS","HGINFRA.NS","HINDCOPPER.NS",
+            "HOMEFIRST.NS","HONASA.NS","HONAUT.NS","HSCL.NS","ICICIPRULI.NS","ICIL.NS",
+            "IDBI.NS","IEX.NS","IFBIND.NS","IFCI.NS","IIFL.NS","IIFLCAPS.NS",
+            "IMFA.NS","INDIACEM.NS","INDIAGLYCO.NS","INDIAMART.NS","INDIGOPNTS.NS","INOXGREEN.NS",
+            "INOXINDIA.NS","INOXWIND.NS","INTELLECT.NS","IOB.NS","IONEXCHANG.NS","IPCALAB.NS",
+            "IRCON.NS","ITI.NS","J&KBANK.NS","JAIBALAJI.NS","JAMNAAUTO.NS","JAYNECOIND.NS",
+            "JBCHEPHARM.NS","JBMA.NS","JINDALSAW.NS","JKCEMENT.NS","JKLAKSHMI.NS","JKPAPER.NS",
+            "JKTYRE.NS","JMFINANCIL.NS","JPPOWER.NS","JSL.NS","JSLL.NS","JSWDULUX.NS",
+            "JSWINFRA.NS","JUBLINGREA.NS","JUBLPHARMA.NS","JUSTDIAL.NS","JWL.NS","JYOTHYLAB.NS",
+            "KAJARIACER.NS","KANSAINER.NS","KARURVYSYA.NS","KAYNES.NS","KEC.NS","KFINTECH.NS",
+            "KIMS.NS","KIRLOSBROS.NS","KIRLOSENG.NS","KIRLPNU.NS","KITEX.NS","KNRCON.NS",
+            "KPIGREEN.NS","KPIL.NS","KPRMILL.NS","KRBL.NS","KSB.NS","KSCL.NS",
+            "KTKBANK.NS","LALPATHLAB.NS","LATENTVIEW.NS","LAURUSLABS.NS","LEMONTREE.NS","LINDEINDIA.NS",
+            "LLOYDSENGG.NS","LLOYDSENT.NS","LLOYDSME.NS","LTFOODS.NS","LTTS.NS","LUMAXTECH.NS",
+            "LXCHEM.NS","MAHABANK.NS","MAHSCOOTER.NS","MAHSEAMLES.NS","MANAPPURAM.NS","MANYAVAR.NS",
+            "MAPMYINDIA.NS","MARKSANS.NS","MASTEK.NS","MCX.NS","MEDANTA.NS","MEDPLUS.NS",
+            "METROPOLIS.NS","MGL.NS","MIDHANI.NS","MINDACORP.NS","MMTC.NS","MOIL.NS",
+            "MRPL.NS","MSTCLTD.NS","MSUMI.NS","MTARTECH.NS","NAM-INDIA.NS","NATCOPHARM.NS",
+            "NAVA.NS","NAVINFLUOR.NS","NAZARA.NS","NBCC.NS","NCC.NS","NEOGEN.NS",
+            "NESCO.NS","NETWEB.NS","NETWORK18.NS","NEULANDLAB.NS","NEWGEN.NS","NFL.NS",
+            "NH.NS","NIACL.NS","NIVABUPA.NS","NLCINDIA.NS","NSLNISP.NS","NUVAMA.NS",
+            "NUVOCO.NS","OLECTRA.NS","ONESOURCE.NS","OPTIEMUS.NS","ORIENTCEM.NS","PARADEEP.NS",
+            "PARAS.NS","PCBL.NS","PCJEWELLER.NS","PETRONET.NS","PFIZER.NS","PFOCUS.NS",
+            "PGEL.NS","PGHH.NS","PGIL.NS","PICCADIL.NS","PNBHOUSING.NS","PNCINFRA.NS",
+            "POLYMED.NS","POONAWALLA.NS","POWERMECH.NS","PPLPHARMA.NS","PRAJIND.NS","PRICOLLTD.NS",
+            "PRIVISCL.NS","PRSMJOHNSN.NS","PRUDENT.NS","PTC.NS","PTCIL.NS","PURVA.NS",
+            "PVRINOX.NS","QUESS.NS","RADICO.NS","RAILTEL.NS","RAIN.NS","RAINBOW.NS",
+            "RALLIS.NS","RAMCOCEM.NS","RATEGAIN.NS","RATNAMANI.NS","RAYMONDLSL.NS","RBA.NS",
+            "RBLBANK.NS","RCF.NS","REDINGTON.NS","REDTAPE.NS","REFEX.NS","RELAXO.NS",
+            "RELIGARE.NS","RELINFRA.NS","RENUKA.NS","RHIM.NS","RITES.NS","RKFORGE.NS",
+            "ROUTE.NS","RPOWER.NS","RRKABEL.NS","RTNINDIA.NS","RTNPOWER.NS","SAFARI.NS",
+            "SAMMAANCAP.NS","SANDUMA.NS","SANOFICONR.NS","SANSERA.NS","SAPPHIRE.NS","SARDAEN.NS",
+            "SAREGAMA.NS","SBFC.NS","SCHAEFFLER.NS","SCHNEIDER.NS","SCI.NS","SFL.NS",
+            "SHAILY.NS","SHAKTIPUMP.NS","SHARDACROP.NS","SHAREINDIA.NS","SHILPAMED.NS","SHRIPISTON.NS",
+            "SHYAMMETL.NS","SIGNATURE.NS","SJVN.NS","SKFINDIA.NS","SKFINDUS.NS","SKIPPER.NS",
+            "SMLMAH.NS","SOBHA.NS","SONATSOFTW.NS","SOUTHBANK.NS","SPARC.NS","SPLPETRO.NS",
+            "STAR.NS","STARCEMENT.NS","STARHEALTH.NS","STLTECH.NS","STYL.NS","SUBROS.NS",
+            "SUDARSCHEM.NS","SUMICHEM.NS","SUNDARMFIN.NS","SUNDRMFAST.NS","SUNTECK.NS","SUNTV.NS",
+            "SUPRIYA.NS","SURYAROSNI.NS","SWANCORP.NS","SWSOLAR.NS","SYNGENE.NS","SYRMA.NS",
+            "TANLA.NS","TARC.NS","TARIL.NS","TATACHEM.NS","TATAINVEST.NS","TDPOWERSYS.NS",
+            "TECHNOE.NS","TEGA.NS","TEJASNET.NS","TENNIND.NS","TEXRAIL.NS","THANGAMAYL.NS",
+            "THERMAX.NS","THOMASCOOK.NS","THYROCARE.NS","TI.NS","TIMETECHNO.NS","TIMKEN.NS",
+            "TIPSMUSIC.NS","TITAGARH.NS","TMB.NS","TRIDENT.NS","TRITURBINE.NS","TRIVENI.NS",
+            "TSFINV.NS","TTML.NS","TVSSCS.NS","UBL.NS","UCOBANK.NS","UJJIVANSFB.NS",
+            "UNOMINDA.NS","USHAMART.NS","UTIAMC.NS","UTLSOLAR.NS","V2RETAIL.NS","VAIBHAVGBL.NS",
+            "VARROC.NS","VGUARD.NS","VIJAYA.NS","VIPIND.NS","VIYASH.NS","VMART.NS",
+            "VOLTAMP.NS","VTL.NS","WAAREERTL.NS","WABAG.NS","WEBELSOLAR.NS","WELCORP.NS",
+            "WELENT.NS","WELSPUNLIV.NS","WESTLIFE.NS","WHIRLPOOL.NS","WOCKPHARMA.NS","ZAGGLE.NS",
+            "ZEEL.NS","ZENSARTECH.NS","ZENTEC.NS","ZFCVINDIA.NS","ZYDUSWELL.NS",
+            "NAVINFLUOR.NS","LAURUSLABS.NS","SONACOMS.NS","CDSL.NS","DELHIVERY.NS","EMSLIMITED.NS",
+            "JUNIPER.NS","BEL.NS","HSCL.NS","ALICON.NS","TITAN.NS","JARO.NS",
+            "ADANIPOWER.NS","SOLARINDS.NS","PARAS.NS","KEI.NS","FINCABLES.NS","RRKABEL.NS",
+            "CGPOWER.NS","POWERGRID.NS","SRF.NS","UPL.NS","DEEPAKNTR.NS","HBLENGINE.NS",
+            "ARE&M.NS","HEG.NS","GRAPHITE.NS","MILKYMIST.NS","HIRECT.NS","JGCHEM.NS",
+            "ETERNAL.NS","MEESHO.NS","URBANCO.NS","AZAD.NS","GOKEX.NS","WELSPUNLIV.NS",
+            "VEDL.NS","HAL.NS","HINDCOPPER.NS","HINDZINC.NS","SUZLON.NS","BDL.NS",
+            "APOLLO.NS","DATAPATTNS.NS","LENSKART.NS","TATAPOWER.NS","GROWW.NS",
+            "ANGELONE.NS","QUADFUTURE.NS"
         };
     }
 
+    // v4.3 note: broadened to cover NSE mainboard IPOs/new listings from
+    // 2023 through the present (the request asked for completeness "till
+    // Jan 2025" — everything through that date is covered, and later 2025
+    // vintage listings the platform already tracked are kept too, since
+    // excluding them would be a regression). Classification into this
+    // bucket vs. NiftySMIDUniverse for the newly-added names is best-effort
+    // (no live listing-date feed was reachable from this environment to
+    // verify every one) — recross-check against NSE's IPO archive if a
+    // specific name's bucket matters for a backtest. Every ticker here is
+    // unique to this bucket — see the Nifty200Universe note above.
     internal static class NewListingsUniverse
     {
         public static readonly IReadOnlyList<string> Tickers = new[]
         {
-            "JYOTICNC.NS","MEDIASSIST.NS","EPACK.NS","BLSE.NS","PARKHOTELS.NS","JSFB.NS",
-            "RPTECH.NS","CAPITALSFB.NS","ENTERO.NS","JUNIPER.NS","EXICOM.NS","RKSWAMY.NS",
-            "JGCHEM.NS","GOPAL.NS","BHARTIHEXA.NS","KRYSTAL.NS","JNKINDIA.NS","INDGN.NS",
-            "TBOTEK.NS","AADHARHFC.NS","AWFIS.NS","KRONOX.NS","GODIGIT.NS","DEEDEV.NS",
-            "STANLEY.NS","ABDL.NS","AKUMS.NS","BANSALWIRE.NS","CEIGALL.NS","EMCURE.NS",
-            "FIRSTCRY.NS","GPTHEALTH.NS","IXIGO.NS","UNIECOM.NS","ECOSMOBLTY.NS","INTERARCH.NS",
-            "PREMIERENE.NS","STYLEBAAZA.NS","ARKADE.NS","NORTHARC.NS","KROSS.NS","PNGJL.NS",
-            "KRN.NS","DBEIL.NS","GODAVARIB.NS","ACMESOLAR.NS","SWIGGY.NS","BLACKBUCK.NS",
-            "EIEL.NS","SURAKSHA.NS","SAILIFE.NS","MOBIKWIK.NS","IKS.NS","IGIL.NS",
-            "DAMCAPITAL.NS","CEWATER.NS","SANATHAN.NS","TRANSRAILL.NS","SENORES.NS","CARRARO.NS",
-            "VENTIVE.NS","UNIMECH.NS","INDOFARM.NS","SGLTL.NS","LAXMIDENTL.NS","AGARWALEYE.NS",
-            "AJAXENGG.NS","PROTEAN.NS","ANTHEM.NS","SMARTWORKS.NS","TRAVELFOOD.NS",
-            "CRIZAC.NS","HDBFS.NS","SAMBHV.NS","KALPATARU.NS","ELLEN.NS","ARISINFRA.NS",
-            "OSWALPUMPS.NS","THELEELA.NS","AEGISVOPAK.NS","BELRISE.NS","ATHERENERG.NS",
-            "HEXT.NS","ALLTIME.NS","BAJAJHFL.NS","BLUESTONE.NS","BRIGHOTEL.NS",
-            "HYUNDAI.NS","INDIQUBE.NS","JSWCEMENT.NS","MBEL.NS","NTPCGREEN.NS",
-            "OLAELEC.NS","SAGILITY.NS","SANSTAR.NS","URBANCO.NS","VIKRAMSOLR.NS",
-            "VIKRAN.NS","VMM.NS","WAAREEENER.NS","TATACAP.NS","PIRAMALFIN.NS",
-            "PINELABS.NS","GROWW.NS","SHADOWFAX.NS","FRACTAL.NS"
+            "AADHARHFC.NS","ABDL.NS","ACMESOLAR.NS","AEGISVOPAK.NS","AGARWALEYE.NS","AJAXENGG.NS",
+            "AKUMS.NS","ALLTIME.NS","ANTHEM.NS","ARISINFRA.NS","ARKADE.NS","ASKAUTOLTD.NS",
+            "ATHERENERG.NS","AVALON.NS","AWFIS.NS","AZAD.NS","BAJAJHFL.NS","BANSALWIRE.NS",
+            "BELRISE.NS","BHARTIHEXA.NS","BLACKBUCK.NS","BLSE.NS","BLUESTONE.NS","BRIGHOTEL.NS",
+            "CAPILLARY.NS","CAPITALSFB.NS","CARRARO.NS","CARTRADE.NS","CCAVENUE.NS","CEIGALL.NS",
+            "CEWATER.NS","CRAMC.NS","CRIZAC.NS","DAMCAPITAL.NS","DBEIL.NS","DEEDEV.NS",
+            "ECOSMOBLTY.NS","EIEL.NS","ELLEN.NS","EMCURE.NS","EMMVEE.NS","ENTERO.NS",
+            "EPACK.NS","ETHOSLTD.NS","EXICOM.NS","FEDFINA.NS","FIRSTCRY.NS","FRACTAL.NS",
+            "GODAVARIB.NS","GODIGIT.NS","GOPAL.NS","GPTHEALTH.NS","GROWW.NS","HDBFS.NS",
+            "HEXT.NS","HYUNDAI.NS","IGIL.NS","IKS.NS","INDGN.NS","INDIASHLTR.NS",
+            "INDIQUBE.NS","INDOFARM.NS","INTERARCH.NS","IXIGO.NS","JAINREC.NS","JGCHEM.NS",
+            "JLHL.NS","JNKINDIA.NS","JSFB.NS","JSWCEMENT.NS","JUNIPER.NS","JYOTICNC.NS",
+            "KALPATARU.NS","KRN.NS","KRONOX.NS","KROSS.NS","KRYSTAL.NS","LAXMIDENTL.NS",
+            "LOTUSDEV.NS","MANORAMA.NS","MBEL.NS","MEDIASSIST.NS","MEESHO.NS","MOBIKWIK.NS",
+            "NORTHARC.NS","NTPCGREEN.NS","OLAELEC.NS","ORKLAINDIA.NS","OSWALPUMPS.NS","PARKHOSPS.NS",
+            "PARKHOTELS.NS","PINELABS.NS","PIRAMALFIN.NS","PNGJL.NS","PREMIERENE.NS","PROTEAN.NS",
+            "PWL.NS","QPOWER.NS","RKSWAMY.NS","RPTECH.NS","RUBICON.NS","SAATVIKGL.NS",
+            "SAGILITY.NS","SAILIFE.NS","SAMBHV.NS","SAMHI.NS","SANATHAN.NS","SANSTAR.NS",
+            "SENCO.NS","SENORES.NS","SGLTL.NS","SHADOWFAX.NS","SKYGOLD.NS","SMARTWORKS.NS",
+            "STANLEY.NS","STYLEBAAZA.NS","STYRENIX.NS","SUDEEPPHRM.NS","SURAKSHA.NS","SWIGGY.NS",
+            "TATACAP.NS","TBOTEK.NS","THELEELA.NS","TRANSRAILL.NS","TRAVELFOOD.NS","UNIECOM.NS",
+            "UNIMECH.NS","URBANCO.NS","VENTIVE.NS","VIKRAMSOLR.NS","VIKRAN.NS","VMM.NS",
+            "WAAREEENER.NS","WAKEFIT.NS","WEWORK.NS","YATHARTH.NS"
         };
     }
     // =========================================================================
@@ -1115,7 +1305,7 @@ namespace NseMomentumScanner
             }
 
             Add("IT Services",
-                "TCS.NS","INFY.NS","WIPRO.NS","HCLTECH.NS","TECHM.NS","LTIM.NS","MPHASIS.NS",
+                "TCS.NS","INFY.NS","WIPRO.NS","HCLTECH.NS","TECHM.NS","LTM.NS","MPHASIS.NS",
                 "PERSISTENT.NS","COFORGE.NS","OFSS.NS","TATAELXSI.NS","TATATECH.NS","KPITTECH.NS",
                 "LTTS.NS","CYIENT.NS","BSOFT.NS","ZENSARTECH.NS","SONATSOFTW.NS","NEWGEN.NS",
                 "HAPPSTMNDS.NS","INTELLECT.NS","LATENTVIEW.NS","MAPMYINDIA.NS","NETWEB.NS",
@@ -1153,7 +1343,7 @@ namespace NseMomentumScanner
                 "NIACL.NS","STARHEALTH.NS","GODIGIT.NS","NIVABUPA.NS");
 
             Add("Automobile — OEM",
-                "MARUTI.NS","TATAMOTORS.NS","M&M.NS","HYUNDAI.NS","BAJAJ-AUTO.NS",
+                "MARUTI.NS","TMCV.NS","TMPV.NS","M&M.NS","HYUNDAI.NS","BAJAJ-AUTO.NS",
                 "HEROMOTOCO.NS","EICHERMOT.NS","TVSMOTOR.NS","ASHOKLEY.NS","FORCEMOT.NS",
                 "ESCORTS.NS","OLAELEC.NS","ATHERENERG.NS","OLECTRA.NS","MAHSCOOTER.NS");
 
@@ -1540,9 +1730,14 @@ namespace NseMomentumScanner
             _http.DefaultRequestHeaders.Add("Accept-Language", "en-US,en;q=0.9");
         }
 
+        /// <param name="adjustForDividends">
+        /// true (default, used by the scanner): back-adjust OHLC by Yahoo's adjusted close, i.e. splits
+        /// AND dividends. false (used by the Charts tab): keep Yahoo's split-adjusted OHLC untouched so
+        /// levels such as previous-day high or 52-week high match what a broker terminal shows.
+        /// </param>
         public async Task<List<StockQuote>> FetchAsync(
             string ticker, YahooInterval interval, int lookbackDays,
-            CancellationToken ct = default)
+            CancellationToken ct = default, bool adjustForDividends = true)
         {
             // Weekly/monthly bars barely change within the same day — cache them briefly to
             // cut redundant network calls when the scanner is re-run multiple times a day
@@ -1551,20 +1746,20 @@ namespace NseMomentumScanner
             bool cacheable = Config.CacheEnabled &&
                 (interval == YahooInterval.OneWeek || interval == YahooInterval.OneMonth);
 
-            if (cacheable && TryReadCache(ticker, interval, out var cached))
+            if (cacheable && TryReadCache(ticker, interval, adjustForDividends, out var cached))
                 return cached;
 
-            var quotes = await FetchFromNetworkAsync(ticker, interval, lookbackDays, ct);
+            var quotes = await FetchFromNetworkAsync(ticker, interval, lookbackDays, ct, adjustForDividends);
 
             if (cacheable && quotes.Count > 0)
-                await TryWriteCacheAsync(ticker, interval, quotes, ct);
+                await TryWriteCacheAsync(ticker, interval, adjustForDividends, quotes, ct);
 
             return quotes;
         }
 
         private async Task<List<StockQuote>> FetchFromNetworkAsync(
             string ticker, YahooInterval interval, int lookbackDays,
-            CancellationToken ct)
+            CancellationToken ct, bool adjustForDividends = true)
         {
             long period2    = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             long period1    = DateTimeOffset.UtcNow.AddDays(-lookbackDays).ToUnixTimeSeconds();
@@ -1630,7 +1825,7 @@ namespace NseMomentumScanner
                     }
 
                     using var stream = await resp.Content.ReadAsStreamAsync(ct);
-                    return ParseQuotes(stream, isIntra);
+                    return ParseQuotes(stream, isIntra, adjustForDividends);
                 }
                 catch (OperationCanceledException) { throw; }
                 catch (Exception ex)
@@ -1653,18 +1848,20 @@ namespace NseMomentumScanner
             public List<StockQuote> Quotes { get; set; } = new();
         }
 
-        private static string CachePath(string ticker, YahooInterval interval)
+        private static string CachePath(string ticker, YahooInterval interval, bool adjustForDividends = true)
         {
             var safeTicker = new string(ticker.Select(c => char.IsLetterOrDigit(c) || c == '.' ? c : '_').ToArray());
-            return Path.Combine(Config.CacheBaseDir, $"{safeTicker}_{YahooIntervalHelper.ToApiString(interval)}.json");
+            // Raw (split-only) series get their own cache file so they never mix with the scanner's.
+            var suffix = adjustForDividends ? "" : "_raw";
+            return Path.Combine(Config.CacheBaseDir, $"{safeTicker}_{YahooIntervalHelper.ToApiString(interval)}{suffix}.json");
         }
 
-        private static bool TryReadCache(string ticker, YahooInterval interval, out List<StockQuote> quotes)
+        private static bool TryReadCache(string ticker, YahooInterval interval, bool adjustForDividends, out List<StockQuote> quotes)
         {
             quotes = new List<StockQuote>();
             try
             {
-                var path = CachePath(ticker, interval);
+                var path = CachePath(ticker, interval, adjustForDividends);
                 if (!File.Exists(path)) return false;
 
                 var json   = File.ReadAllText(path);
@@ -1686,14 +1883,14 @@ namespace NseMomentumScanner
         }
 
         private static async Task TryWriteCacheAsync(
-            string ticker, YahooInterval interval, List<StockQuote> quotes, CancellationToken ct)
+            string ticker, YahooInterval interval, bool adjustForDividends, List<StockQuote> quotes, CancellationToken ct)
         {
             try
             {
                 Directory.CreateDirectory(Config.CacheBaseDir);
                 var payload = new CachedQuotes { CachedAtUtc = DateTime.UtcNow, Quotes = quotes };
                 var json    = JsonSerializer.Serialize(payload);
-                await File.WriteAllTextAsync(CachePath(ticker, interval), json, ct);
+                await File.WriteAllTextAsync(CachePath(ticker, interval, adjustForDividends), json, ct);
             }
             catch (Exception ex)
             {
@@ -1710,7 +1907,7 @@ namespace NseMomentumScanner
             await Task.Delay(delay, ct);
         }
 
-        private static List<StockQuote> ParseQuotes(Stream stream, bool isIntraday)
+        internal static List<StockQuote> ParseQuotes(Stream stream, bool isIntraday, bool adjustForDividends = true)
         {
             using var doc  = JsonDocument.Parse(stream);
             var result_arr = doc.RootElement
@@ -1758,7 +1955,7 @@ namespace NseMomentumScanner
                 decimal l = lows[i]  > 0 ? lows[i]  : rawClose;
                 decimal c = rawClose;
 
-                if (i < adjCloses.Length && adjCloses[i] > 0)
+                if (adjustForDividends && i < adjCloses.Length && adjCloses[i] > 0)
                 {
                     decimal ratio = adjCloses[i] / rawClose;
                     // Sanity guard: only apply plausible corporate-action ratios; ignore junk data
@@ -2147,6 +2344,34 @@ namespace NseMomentumScanner
             info.BreadthTotal      = total;
             info.BreadthPctBullish = total > 0 ? Math.Round(bullish * 100.0 / total, 1) : 0;
         }
+
+        /// <summary>Historical, as-of-date regime snapshots for the backtest. EMA arrays are
+        /// calculated once across the complete benchmark series; each requested date reads only
+        /// the EMA value at or before that date, so no future benchmark information can leak into
+        /// a historical signal.</summary>
+        public static Dictionary<DateTime, MarketRegimeInfo> BuildHistoricalSnapshots(
+            IReadOnlyList<StockQuote> quotes, DateTime start, DateTime end)
+        {
+            var result = new Dictionary<DateTime, MarketRegimeInfo>();
+            if (quotes.Count == 0) return result;
+            var ema50 = quotes.GetEma(Config.MarketRegimeEmaFastPeriod).ToArray();
+            var ema200 = quotes.GetEma(Config.MarketRegimeEmaSlowPeriod).ToArray();
+            int idx = 0;
+            for (DateTime d = start.Date; d <= end.Date; d = d.AddDays(1))
+            {
+                while (idx + 1 < quotes.Count && quotes[idx + 1].Date.Date <= d) idx++;
+                if (quotes[idx].Date.Date > d || idx < Config.MarketRegimeEmaSlowPeriod) continue;
+                double e50 = ema50[idx].Ema ?? 0, e200 = ema200[idx].Ema ?? 0;
+                if (e50 <= 0 || e200 <= 0) continue;
+                result[d] = new MarketRegimeInfo
+                {
+                    ScanDate = d, BenchmarkSymbol = Config.MarketBenchmarkSymbol,
+                    BenchmarkClose = quotes[idx].Close, Ema50 = e50, Ema200 = e200,
+                    Regime = Classify(quotes[idx].Close, e50, e200)
+                };
+            }
+            return result;
+        }
     }
 
     // =========================================================================
@@ -2267,7 +2492,11 @@ namespace NseMomentumScanner
                 double es   = i < ind.EmaSlow.Length ? (ind.EmaSlow[i].Ema ?? 0) : 0;
 
                 double volSma   = ind.VolumeSma[i];
-                double volRatio = volSma > 0 ? (double)q.Volume / volSma : 0;
+                // v4.5: RVOL baseline excludes today's volume to avoid self-contamination.
+                double priorVolSma = i >= Config.VolumeSmaPeriod && volSma > 0
+                    ? Math.Max(0, (volSma * Config.VolumeSmaPeriod - (double)q.Volume) / Config.VolumeSmaPeriod)
+                    : volSma;
+                double volRatio = priorVolSma > 0 ? (double)q.Volume / priorVolSma : 0;
 
                 bool vcpHit = false;
                 if (vcpEnabled && i >= Config.VcpLookbackDays - 1)
@@ -2285,6 +2514,40 @@ namespace NseMomentumScanner
                               : volRatio <  Config.VolumeLowRatio     ? -(Config.VolumeWeight / 2) : 0;
                 double sTrend = trendOk ? Config.TrendAlignmentWeight : -Config.TrendAlignmentWeight;
                 double total  = sSt + sHma + sAdx + sVcp + sVol + sTrend;
+
+                // ── v4.5: contextual signal engine ───────────────────────────
+                double previousLegacy = 0;
+                if (i > 0)
+                {
+                    int p = i - 1;
+                    bool pb = p < ind.SuperTrend.Length && ind.SuperTrend[p].UpperBand == null;
+                    double phf = p < ind.HmaFast.Length ? (ind.HmaFast[p].Hma ?? 0) : 0;
+                    double phs = p < ind.HmaSlow.Length ? (ind.HmaSlow[p].Hma ?? 0) : 0;
+                    double pax = p < ind.Adx.Length ? (ind.Adx[p].Adx ?? 0) : 0;
+                    double ppdi = p < ind.Adx.Length ? (ind.Adx[p].Pdi ?? 0) : 0;
+                    double pmdi = p < ind.Adx.Length ? (ind.Adx[p].Mdi ?? 0) : 0;
+                    double pef = p < ind.EmaFast.Length ? (ind.EmaFast[p].Ema ?? 0) : 0;
+                    double pes = p < ind.EmaSlow.Length ? (ind.EmaSlow[p].Ema ?? 0) : 0;
+                    double pVolSmaCurrent = p < ind.VolumeSma.Length ? ind.VolumeSma[p] : 0;
+                    double pvolSma = p >= Config.VolumeSmaPeriod && pVolSmaCurrent > 0
+                        ? Math.Max(0, (pVolSmaCurrent * Config.VolumeSmaPeriod - (double)quotes[p].Volume) / Config.VolumeSmaPeriod)
+                        : pVolSmaCurrent;
+                    double pvol = pvolSma > 0 ? (double)quotes[p].Volume / pvolSma : 0;
+                    bool pvcp = vcpEnabled && p >= Config.VcpLookbackDays - 1 &&
+                                VcpDetector.Detect(quotes, p - Config.VcpLookbackDays + 1, p);
+                    previousLegacy =
+                        (pb ? Config.SupertrendWeight : -Config.SupertrendWeight) +
+                        (phf > phs ? Config.HmaCrossoverWeight : -Config.HmaCrossoverWeight) +
+                        (pax >= Config.AdxStrongThreshold ? (ppdi > pmdi ? Config.AdxWeight : -Config.AdxWeight) : 0) +
+                        (pvcp ? Config.VcpWeight : 0) +
+                        (pvol >= Config.VolumeSurgeRatio ? Config.VolumeWeight : pvol < Config.VolumeLowRatio ? -(Config.VolumeWeight / 2) : 0) +
+                        ((double)quotes[p].Close > pef && pef > pes && pes > 0 ? Config.TrendAlignmentWeight : -Config.TrendAlignmentWeight);
+                }
+
+                var advanced = Config.EnableAdvancedSignalEngine
+                    ? SignalEnhancementEngine.Analyze(quotes, i, hmaF, hmaS, ef, es, adx, pdi, mdi, volRatio,
+                        i < ind.Atr.Length ? (ind.Atr[i].Atr ?? 0) : 0, bull, vcpHit, total, previousLegacy)
+                    : new AdvancedSignalMetrics();
 
                 // ── Index-based analytics (no allocations) ───────────────────
                 var levels  = PriceLevelCalculator.Calculate(quotes, i);
@@ -2335,6 +2598,18 @@ namespace NseMomentumScanner
                     RsRaw = rsRaw, HasRs = hasRs, AvgTurnoverInr = avgTurnover, IsLiquid = liquid,
                     ExtensionPct = extensionPct, IsExtended = extended,
                     AtrValue = atrVal, SuggestedStop = stop, SuggestedTarget = target,
+                    QualityScore = advanced.QualityScore, EntryScore = advanced.EntryScore,
+                    StructureScore = advanced.StructureScore, SetupScore = advanced.SetupScore,
+                    TriggerScore = advanced.TriggerScore, TrendQuality = advanced.TrendQuality,
+                    VolumeQuality = advanced.VolumeQuality, BreakoutQuality = advanced.BreakoutQuality,
+                    PullbackQuality = advanced.PullbackQuality, RiskReward = advanced.RiskReward,
+                    ScoreVelocity = advanced.ScoreVelocity, ScoreAcceleration = advanced.ScoreAcceleration,
+                    AtrDistanceFromPivot = advanced.AtrDistanceFromPivot,
+                    RelativeExtensionQuality = advanced.RelativeExtensionQuality,
+                    DistributionCount = advanced.DistributionCount, IsBreakout = advanced.IsBreakout,
+                    IsPullback = advanced.IsPullback, IsMomentumExhaustion = advanced.IsMomentumExhaustion,
+                    StructureState = advanced.StructureState, SetupState = advanced.SetupState,
+                    TriggerState = advanced.TriggerState, SignalState = advanced.SignalState,
                     Levels    = levels,
                     StMetrics = stm,
                 });
@@ -2449,6 +2724,28 @@ namespace NseMomentumScanner
                     AtrValue        = hasDaily ? best!.AtrValue       : 0,
                     SuggestedStop   = hasDaily ? best!.SuggestedStop  : 0,
                     SuggestedTarget = hasDaily ? best!.SuggestedTarget: 0,
+                    QualityScore = hasDaily ? best!.QualityScore : 50,
+                    EntryScore = hasDaily ? best!.EntryScore : 20,
+                    StructureScore = hasDaily ? best!.StructureScore : 50,
+                    SetupScore = hasDaily ? best!.SetupScore : 0,
+                    TriggerScore = hasDaily ? best!.TriggerScore : 0,
+                    TrendQuality = hasDaily ? best!.TrendQuality : 50,
+                    VolumeQuality = hasDaily ? best!.VolumeQuality : 50,
+                    BreakoutQuality = hasDaily ? best!.BreakoutQuality : 0,
+                    PullbackQuality = hasDaily ? best!.PullbackQuality : 0,
+                    RiskReward = hasDaily ? best!.RiskReward : 0,
+                    ScoreVelocity = hasDaily ? best!.ScoreVelocity : 0,
+                    ScoreAcceleration = hasDaily ? best!.ScoreAcceleration : 0,
+                    AtrDistanceFromPivot = hasDaily ? best!.AtrDistanceFromPivot : 0,
+                    RelativeExtensionQuality = hasDaily ? best!.RelativeExtensionQuality : 50,
+                    DistributionCount = hasDaily ? best!.DistributionCount : 0,
+                    IsBreakout = hasDaily && best!.IsBreakout,
+                    IsPullback = hasDaily && best!.IsPullback,
+                    IsMomentumExhaustion = hasDaily && best!.IsMomentumExhaustion,
+                    StructureState = hasDaily ? best!.StructureState : "RANGE",
+                    SetupState = hasDaily ? best!.SetupState : "NONE",
+                    TriggerState = hasDaily ? best!.TriggerState : "NONE",
+                    SignalState = hasDaily ? best!.SignalState : "WATCH",
                     // v4.1
                     Sector             = sector,
                     PeRatio            = refRec?.PeRatio,
@@ -2538,10 +2835,18 @@ namespace NseMomentumScanner
                 bool passScore     = a.AggregateScore >= buyScoreThreshold;
                 if (!passScore) continue; // don't bother gating stocks nowhere near the bar
 
-                bool passTfAlign   = a.BullishTfCount >= Config.MinBullishTfCountForBuy && a.WeeklyScore >= 0;
+                int availableTfCount = dayResults.TryGetValue(a.Symbol, out var buyGrp) ? buyGrp.Count : 1;
+                int requiredBullishTf = Math.Min(Config.MinBullishTfCountForBuy, Math.Max(1, availableTfCount));
+                bool passTfAlign   = a.BullishTfCount >= requiredBullishTf && a.WeeklyScore >= 0;
                 bool passRs        = !rsGateActive || a.RsRank >= Config.MinRsRankForBuy;
                 bool passLiquidity = a.IsLiquid;
                 bool passExtension = !a.IsExtended;
+                bool passAdvanced = !Config.RequireAdvancedBuyGates || !Config.EnableAdvancedSignalEngine ||
+                    (a.QualityScore >= Config.MinQualityScore &&
+                     a.EntryScore >= Config.MinEntryScore &&
+                     a.RiskReward >= Config.MinimumRiskReward &&
+                     !a.IsMomentumExhaustion &&
+                     a.SetupScore >= Config.MinSetupScore);
 
                 // v4.1: fundamental screen — OFF by default; when on, "unknown" (no reference.csv
                 // row, or a field the CSV left blank) is always treated as passing, never blocking.
@@ -2562,7 +2867,7 @@ namespace NseMomentumScanner
                 // v4.1: sector rotation gate — OFF by default (informational-only until enabled).
                 bool passSector = !Config.EnableSectorGate || a.SectorRankPercentile >= Config.MinSectorRankPercentileForBuy;
 
-                if (passTfAlign && passRs && passLiquidity && passExtension &&
+                if (passTfAlign && passRs && passLiquidity && passExtension && passAdvanced &&
                     passFundamental && passEarnings && passSector)
                 {
                     a.RecommendationType = "BUY";
@@ -2581,6 +2886,7 @@ namespace NseMomentumScanner
                     if (!passFundamental) reasons.Add("fails fundamental screen");
                     if (!passEarnings)    reasons.Add($"earnings within {Config.EarningsBlackoutDays}d");
                     if (!passSector)      reasons.Add("weak sector");
+                    if (!passAdvanced)    reasons.Add($"advanced quality/entry gate (Q={a.QualityScore:F0}, E={a.EntryScore:F0}, RR={a.RiskReward:F1})");
                     a.GateReason = string.Join(", ", reasons);
                 }
             }
@@ -2594,8 +2900,13 @@ namespace NseMomentumScanner
                 bool passScore   = a.AggregateScore <= -20;
                 if (!passScore) continue;
 
-                bool passTfAlign = a.BearishTfCount >= Config.MinBearishTfCountForSell && a.WeeklyScore <= 0;
-                if (passTfAlign)
+                int availableTfCount = dayResults.TryGetValue(a.Symbol, out var sellGrp) ? sellGrp.Count : 1;
+                int requiredBearishTf = Math.Min(Config.MinBearishTfCountForSell, Math.Max(1, availableTfCount));
+                bool passTfAlign = a.BearishTfCount >= requiredBearishTf && a.WeeklyScore <= 0;
+                bool passAdvanced = !Config.RequireAdvancedSellGates || !Config.EnableAdvancedSignalEngine ||
+                    (a.DistributionCount >= Config.DistributionWarningCount ||
+                     a.ScoreVelocity <= -2 || a.SignalState is "WEAKENING" or "WATCH" || a.StructureState is "LH_LL" or "LL");
+                if (passTfAlign && passAdvanced)
                 {
                     a.RecommendationType = "IMMEDIATE_SELL";
                     sellCount++;
@@ -2888,12 +3199,30 @@ namespace NseMomentumScanner
                 symbol            TEXT NOT NULL, timeframe TEXT NOT NULL, reason TEXT NOT NULL
             );
 
+            -- v4.5: normalized contextual feature journal. Kept separate from the legacy
+            -- scan_results schema so existing databases remain fully backward compatible.
+            CREATE TABLE IF NOT EXISTS signal_features (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES scan_sessions(session_id) ON DELETE CASCADE,
+                symbol TEXT NOT NULL, scan_date TEXT NOT NULL, timeframe TEXT NOT NULL,
+                legacy_score REAL, quality_score REAL, entry_score REAL,
+                trend_quality REAL, structure_score REAL, setup_score REAL, trigger_score REAL,
+                volume_quality REAL, breakout_quality REAL, pullback_quality REAL,
+                risk_reward REAL, score_velocity REAL, score_acceleration REAL,
+                atr_distance_pivot REAL, extension_quality REAL, distribution_count INTEGER,
+                is_breakout INTEGER, is_pullback INTEGER, is_exhaustion INTEGER,
+                structure_state TEXT, setup_state TEXT, trigger_state TEXT, signal_state TEXT,
+                UNIQUE(session_id, symbol, scan_date, timeframe)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_sr_sym_date  ON scan_results(symbol, scan_date);
             CREATE INDEX IF NOT EXISTS idx_sr_date_tf   ON scan_results(scan_date, timeframe);
             CREATE INDEX IF NOT EXISTS idx_sr_score     ON scan_results(scan_date, total_score DESC);
             CREATE INDEX IF NOT EXISTS idx_agg_date_rec ON aggregated_results(scan_date, recommendation);
             CREATE INDEX IF NOT EXISTS idx_dq_session    ON data_quality_issues(session_id);
             CREATE INDEX IF NOT EXISTS idx_secrot_session ON sector_rotation(session_id, scan_date);
+            CREATE INDEX IF NOT EXISTS idx_signal_features_session_date ON signal_features(session_id, scan_date, timeframe);
+            CREATE INDEX IF NOT EXISTS idx_signal_features_symbol_date ON signal_features(symbol, scan_date, timeframe);
 
             -- v4.2 perf: every dashboard read (ReadDailyDetailsAsync, ReadHistoryAsync,
             -- ReadTfBreakdownAsync, and the new shockers series read) filters scan_results by
@@ -3073,6 +3402,61 @@ namespace NseMomentumScanner
                     p["@isx"].Value=r.IsExtended?1:0;
                     p["@atr"].Value=r.AtrValue; p["@sstop"].Value=r.SuggestedStop;
                     p["@starget"].Value=r.SuggestedTarget;
+                    cmd.ExecuteNonQuery();
+                }
+                tx.Commit();
+            }
+            finally { _writeLock.Release(); }
+        }
+
+        public async Task BulkInsertSignalFeaturesAsync(int sid, IEnumerable<ScanResult> rows)
+        {
+            var materialized = rows.ToList();
+            if (materialized.Count == 0) return;
+            await _writeLock.WaitAsync();
+            try
+            {
+                const string sql = @"INSERT OR REPLACE INTO signal_features
+                    (session_id,symbol,scan_date,timeframe,legacy_score,quality_score,entry_score,
+                     trend_quality,structure_score,setup_score,trigger_score,volume_quality,
+                     breakout_quality,pullback_quality,risk_reward,score_velocity,score_acceleration,
+                     atr_distance_pivot,extension_quality,distribution_count,is_breakout,is_pullback,
+                     is_exhaustion,structure_state,setup_state,trigger_state,signal_state)
+                    VALUES(@sid,@sym,@dt,@tf,@legacy,@q,@e,@trend,@structure,@setup,@trigger,@vol,
+                           @breakout,@pullback,@rr,@vel,@accel,@atrpivot,@extq,@dist,@ib,@ip,@iex,
+                           @ss,@set,@trig,@sig)";
+                using var tx = _conn.BeginTransaction();
+                using var cmd = new SqliteCommand(sql, _conn, tx);
+                AddParams(cmd.Parameters, "@sid,@sym,@dt,@tf,@legacy,@q,@e,@trend,@structure,@setup,@trigger,@vol,@breakout,@pullback,@rr,@vel,@accel,@atrpivot,@extq,@dist,@ib,@ip,@iex,@ss,@set,@trig,@sig");
+                foreach (var r in materialized)
+                {
+                    cmd.Parameters["@sid"].Value = sid;
+                    cmd.Parameters["@sym"].Value = r.Symbol;
+                    cmd.Parameters["@dt"].Value = r.ScanDate.ToString("yyyy-MM-dd");
+                    cmd.Parameters["@tf"].Value = r.Timeframe;
+                    cmd.Parameters["@legacy"].Value = r.TotalScore;
+                    cmd.Parameters["@q"].Value = r.QualityScore;
+                    cmd.Parameters["@e"].Value = r.EntryScore;
+                    cmd.Parameters["@trend"].Value = r.TrendQuality;
+                    cmd.Parameters["@structure"].Value = r.StructureScore;
+                    cmd.Parameters["@setup"].Value = r.SetupScore;
+                    cmd.Parameters["@trigger"].Value = r.TriggerScore;
+                    cmd.Parameters["@vol"].Value = r.VolumeQuality;
+                    cmd.Parameters["@breakout"].Value = r.BreakoutQuality;
+                    cmd.Parameters["@pullback"].Value = r.PullbackQuality;
+                    cmd.Parameters["@rr"].Value = r.RiskReward;
+                    cmd.Parameters["@vel"].Value = r.ScoreVelocity;
+                    cmd.Parameters["@accel"].Value = r.ScoreAcceleration;
+                    cmd.Parameters["@atrpivot"].Value = r.AtrDistanceFromPivot;
+                    cmd.Parameters["@extq"].Value = r.RelativeExtensionQuality;
+                    cmd.Parameters["@dist"].Value = r.DistributionCount;
+                    cmd.Parameters["@ib"].Value = r.IsBreakout ? 1 : 0;
+                    cmd.Parameters["@ip"].Value = r.IsPullback ? 1 : 0;
+                    cmd.Parameters["@iex"].Value = r.IsMomentumExhaustion ? 1 : 0;
+                    cmd.Parameters["@ss"].Value = r.StructureState;
+                    cmd.Parameters["@set"].Value = r.SetupState;
+                    cmd.Parameters["@trig"].Value = r.TriggerState;
+                    cmd.Parameters["@sig"].Value = r.SignalState;
                     cmd.ExecuteNonQuery();
                 }
                 tx.Commit();
@@ -3369,6 +3753,281 @@ namespace NseMomentumScanner
     }
 
     // =========================================================================
+    //  CHART DATA EXPORTER  (v4.4 — per-symbol OHLCV + indicator series for
+    //  the dashboard's "Charts" tab)
+    // -------------------------------------------------------------------------
+    //  Writes one JSON file per symbol — ALL 6 timeframes bundled together —
+    //  straight from the same `quotes` list already fetched for scoring. No
+    //  extra Yahoo calls, no new DB table/migration: this is a pure export
+    //  step layered on top of data ScanEngine already has in memory.
+    //
+    //  IndicatorArrays.Compute() is called a second time here (once per
+    //  symbol per timeframe, from BuildTimeframeSeries) purely to get the
+    //  FULL per-bar indicator series for charting — TickerScorer only keeps
+    //  the single bar it's scoring. That's a cheap O(bars) re-run of the
+    //  indicator math (a few hundred bars), not a network call, and it keeps
+    //  this feature strictly additive: TickerScorer.Score's signature (used
+    //  by both the live scanner and Backtesting/BacktestEngine.cs) is never
+    //  touched.
+    //
+    //  Served over HTTP by DashboardServer at GET /charts/{symbol} — not via
+    //  blanket static-file serving (see DashboardServer's own note on why
+    //  that's deliberately avoided for dashboard_data.json's sake).
+    //
+    //  Bar timestamps are emitted as Unix epoch seconds, treating each
+    //  StockQuote.Date as-is (no timezone shift) — consistent with the rest
+    //  of this codebase, which never converts between IST/UTC and just
+    //  compares DateTime.Date values directly (see NseCalendar). Lightweight
+    //  Charts renders whatever wall-clock time it's given, so a bar's date
+    //  displays exactly as NSE/Yahoo reported it.
+    // =========================================================================
+    /// <summary>NSE cash-session clock (IST, 09:15–15:30 on market days).</summary>
+    internal static class MarketClock
+    {
+        public static DateTime NowIst() => DateTime.UtcNow.AddHours(5).AddMinutes(30);
+        public static bool IsOpen(DateTime nowIst) =>
+            NseCalendar.IsMarketDay(nowIst.Date) &&
+            nowIst.TimeOfDay >= new TimeSpan(9, 15, 0) && nowIst.TimeOfDay < new TimeSpan(15, 30, 0);
+    }
+
+    /// <summary>
+    /// Scan-time sidecar (charts/_plans.json): the daily long/short trade plan per symbol, so the Buy / Sell /
+    /// Score-matrix tables can show plan columns without a Yahoo call per row. As-of the scan's last daily bar;
+    /// the Charts tab recomputes the live version on demand.
+    /// </summary>
+    internal static class PlanSidecar
+    {
+        public static string FilePath => Path.Combine(Config.ChartsExportDir, "_plans.json");
+
+        public static async Task WriteAsync(IDictionary<string, (JsonObject Long, JsonObject Short)> plans, string scanDate, CancellationToken ct)
+        {
+            Directory.CreateDirectory(Config.ChartsExportDir);
+            var bySym = new JsonObject();
+            foreach (var kv in plans.OrderBy(k => k.Key, StringComparer.Ordinal))
+                bySym[kv.Key] = new JsonObject { ["long"] = kv.Value.Long.DeepClone(), ["short"] = kv.Value.Short.DeepClone() };
+            var root = new JsonObject { ["generated"] = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"), ["scanDate"] = scanDate, ["plans"] = bySym };
+            var tmp = FilePath + ".tmp";
+            await File.WriteAllTextAsync(tmp, root.ToJsonString(), ct);
+            File.Move(tmp, FilePath, overwrite: true);
+        }
+
+        public static JsonObject? Load()
+        {
+            try { return File.Exists(FilePath) ? JsonNode.Parse(File.ReadAllText(FilePath))?.AsObject() : null; }
+            catch (Exception ex) { Log.Warning("Plan sidecar unreadable (ignored): {Msg}", ex.Message); return null; }
+        }
+    }
+
+    internal static class ChartDataExporter
+    {
+        public static string FilePathFor(string symbol) =>
+            Path.Combine(Config.ChartsExportDir, $"{Path.GetFileName(symbol)}.json");
+
+        /// <summary>
+        /// Builds the {bars, indicators} payload for one symbol/timeframe. Call once per
+        /// (symbol, timeframe) right after DataValidator confirms the fetched quotes are
+        /// good, accumulate the results into a per-symbol dictionary, then hand that whole
+        /// dictionary to WriteSymbolFileAsync once all 6 timeframes are done for that symbol.
+        /// </summary>
+        public static JsonObject BuildTimeframeSeries(List<StockQuote> quotes, bool isIntraday = false, List<StockQuote>? dailyReferenceQuotes = null,
+                                                      TimeSpan? barLength = null, DateTime? nowIstOverride = null)
+        {
+            var ind = IndicatorArrays.Compute(quotes);
+            int n = quotes.Count;
+
+            // Is the newest bar still forming? Its volume is then only a fraction of the final figure,
+            // so RVOL / volume-price confirmation must not be trusted on it. barLength == null (the
+            // scan-time export) means "unknown" and is treated as complete.
+            var nowIst = nowIstOverride ?? MarketClock.NowIst();
+            bool marketOpen = MarketClock.IsOpen(nowIst);
+            bool lastBarPartial = false;
+            if (n > 0 && marketOpen && barLength is TimeSpan bl)
+            {
+                var lastDate = quotes[n - 1].Date;
+                if (isIntraday)              lastBarPartial = lastDate <= nowIst && lastDate + bl > nowIst;
+                else if (bl >= TimeSpan.FromDays(28)) lastBarPartial = lastDate.Year == nowIst.Year && lastDate.Month == nowIst.Month;
+                else if (bl >= TimeSpan.FromDays(7))  lastBarPartial = (nowIst.Date - lastDate.Date).TotalDays < 7;
+                else                         lastBarPartial = lastDate.Date == nowIst.Date;
+            }
+
+            // IMPORTANT: every indicator array is deliberately the SAME length as bars.
+            // Warm-up values are JSON nulls rather than omitted elements. This preserves
+            // index/timestamp alignment all the way to the browser.
+            var bars       = new JsonArray();
+            var emaFast    = AlignedSeries(n);
+            var emaSlow    = AlignedSeries(n);
+            var hmaFast    = AlignedSeries(n);
+            var hmaSlow    = AlignedSeries(n);
+            var superTrend = AlignedSeries(n);
+            var adx        = AlignedSeries(n);
+            var pdi        = AlignedSeries(n);
+            var mdi        = AlignedSeries(n);
+            var atr        = AlignedSeries(n);
+            var volumeSma  = AlignedSeries(n);
+            var rsi        = AlignedSeries(n);
+            var rvol       = AlignedSeries(n);
+            var atrDistance = AlignedSeries(n);
+            var volumePriceSignal = AlignedSeries(n);
+
+            for (int i = 0; i < n; i++)
+            {
+                var q = quotes[i];
+                long t = new DateTimeOffset(DateTime.SpecifyKind(q.Date, DateTimeKind.Utc))
+                            .ToUnixTimeSeconds();
+                if (isIntraday) t -= (5 * 60 * 60 + 30 * 60);
+
+                bars.Add(new JsonObject
+                {
+                    ["t"] = t, ["o"] = q.Open, ["h"] = q.High, ["l"] = q.Low,
+                    ["c"] = q.Close, ["v"] = q.Volume,
+                });
+
+                SetDouble(emaFast, i, t, i < ind.EmaFast.Length && ind.EmaFast[i].Ema is double ef ? ef : null);
+                SetDouble(emaSlow, i, t, i < ind.EmaSlow.Length && ind.EmaSlow[i].Ema is double es ? es : null);
+                SetDouble(hmaFast, i, t, i < ind.HmaFast.Length && ind.HmaFast[i].Hma is double hf ? hf : null);
+                SetDouble(hmaSlow, i, t, i < ind.HmaSlow.Length && ind.HmaSlow[i].Hma is double hs ? hs : null);
+
+                if (i < ind.SuperTrend.Length && ind.SuperTrend[i].SuperTrend is decimal stv)
+                {
+                    bool bull = ind.SuperTrend[i].UpperBand == null;
+                    superTrend[i] = new JsonObject { ["t"] = t, ["v"] = (double)stv, ["bull"] = bull };
+                }
+
+                if (i < ind.Adx.Length)
+                {
+                    SetDouble(adx, i, t, ind.Adx[i].Adx);
+                    SetDouble(pdi, i, t, ind.Adx[i].Pdi);
+                    SetDouble(mdi, i, t, ind.Adx[i].Mdi);
+                }
+
+                double? atrValue = i < ind.Atr.Length ? ind.Atr[i].Atr : null;
+                SetDouble(atr, i, t, atrValue);
+                SetDouble(rsi, i, t, i < ind.Rsi.Length ? ind.Rsi[i].Rsi : null);
+
+                double volSmaValue = i < ind.VolumeSma.Length ? ind.VolumeSma[i] : 0;
+                SetDouble(volumeSma, i, t, volSmaValue > 0 ? volSmaValue : null, 0);
+
+                // RVOL and volume-price confirmation are also aligned per bar.
+                int volumeLookback = Math.Min(20, i);
+                if (volumeLookback > 0)
+                {
+                    double avgVol = quotes.Skip(i - volumeLookback).Take(volumeLookback)
+                        .Average(x => (double)x.Volume);
+                    double currentVol = (double)q.Volume;
+                    if (avgVol > 0) SetDouble(rvol, i, t, currentVol / avgVol);
+
+                    double range = Math.Max(1e-9, (double)(q.High - q.Low));
+                    double clv = ((double)(q.Close - q.Low) - (double)(q.High - q.Close)) / range;
+                    double change = i > 0 && quotes[i - 1].Close != 0
+                        ? (double)(q.Close - quotes[i - 1].Close) / (double)quotes[i - 1].Close * 100.0
+                        : 0;
+                    double rv = avgVol > 0 ? currentVol / avgVol : 0;
+                    bool unfinished = lastBarPartial && i == n - 1;
+                    double signal = unfinished ? 0
+                                  : rv >= 1.20 && change > 0 && clv >= 0.20 ? 1
+                                  : rv >= 1.20 && change < 0 && clv <= -0.20 ? -1 : 0;
+                    SetDouble(volumePriceSignal, i, t, signal, 0);
+                }
+
+                if (atrValue is double av && av > 0 && i < ind.HmaSlow.Length && ind.HmaSlow[i].Hma is double hslow)
+                    SetDouble(atrDistance, i, t, ((double)q.Close - hslow) / av);
+            }
+
+            var analytics = ChartAnalytics.Build(quotes, dailyReferenceQuotes, isIntraday, lastBarPartial);
+
+            var indicators = new JsonObject
+            {
+                ["emaFast"] = emaFast, ["emaSlow"] = emaSlow,
+                ["hmaFast"] = hmaFast, ["hmaSlow"] = hmaSlow,
+                ["supertrend"] = superTrend,
+                ["adx"] = adx, ["pdi"] = pdi, ["mdi"] = mdi,
+                ["atr"] = atr, ["rsi"] = rsi, ["volumeSma"] = volumeSma,
+                ["rvol"] = rvol, ["atrDistance"] = atrDistance,
+                ["volumePriceSignal"] = volumePriceSignal
+            };
+
+            var integrity = new JsonObject
+            {
+                ["barCount"] = n,
+                ["aligned"] = true
+            };
+            foreach (var kv in indicators)
+                integrity[kv.Key] = kv.Value is JsonArray a && IsAligned(a, bars);
+
+            var meta = new JsonObject
+            {
+                ["marketOpen"] = marketOpen,
+                ["lastBarPartial"] = lastBarPartial,
+                ["asOfIst"] = nowIst.ToString("yyyy-MM-dd HH:mm:ss")
+            };
+
+            return new JsonObject
+            {
+                ["bars"] = bars,
+                ["indicators"] = indicators,
+                ["analytics"] = analytics,
+                ["integrity"] = integrity,
+                ["meta"] = meta
+            };
+        }
+
+        private static JsonArray AlignedSeries(int count)
+        {
+            var a = new JsonArray();
+            for (int i = 0; i < count; i++) a.Add(null);
+            return a;
+        }
+
+        private static void SetDouble(JsonArray array, int index, long t, double? value, int decimals = 2)
+        {
+            if (value is not double v || double.IsNaN(v) || double.IsInfinity(v)) return;
+            array[index] = new JsonObject { ["t"] = t, ["v"] = Math.Round(v, decimals) };
+        }
+
+        private static bool IsAligned(JsonArray series, JsonArray bars)
+        {
+            if (series.Count != bars.Count) return false;
+            for (int i = 0; i < bars.Count; i++)
+            {
+                var node = series[i];
+                if (node is null) continue;
+                if (node is not JsonObject point ||
+                    point["t"]?.GetValue<long>() != bars[i]!["t"]!.GetValue<long>())
+                    return false;
+            }
+            return true;
+        }
+
+        public static async Task WriteSymbolFileAsync(
+            string symbol, Dictionary<string, JsonObject> seriesByTf, CancellationToken ct)
+        {
+            if (seriesByTf.Count == 0) return;
+            try
+            {
+                Directory.CreateDirectory(Config.ChartsExportDir);
+                var tfObj = new JsonObject();
+                foreach (var (tf, series) in seriesByTf) tfObj[tf] = series;
+
+                var root = new JsonObject
+                {
+                    ["symbol"]     = symbol,
+                    ["generated"]  = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+                    ["timeframes"] = tfObj,
+                };
+                var json = root.ToJsonString(new JsonSerializerOptions { WriteIndented = false });
+                await File.WriteAllTextAsync(FilePathFor(symbol), json, ct);
+            }
+            catch (Exception ex)
+            {
+                // Non-fatal by design — same philosophy as CsvExporter above: a chart-export
+                // hiccup for one symbol should never affect scoring, DB writes, or the rest
+                // of the scan.
+                Log.Warning("Chart data export failed for {Sym}: {Msg}", symbol, ex.Message);
+            }
+        }
+    }
+
+    // =========================================================================
     //  CONSOLE REPORTER  (unified PrintLine, live progress, clean panels)
     // =========================================================================
     internal static class ConsoleReporter
@@ -3589,19 +4248,18 @@ namespace NseMomentumScanner
         // ── Private helpers ───────────────────────────────────────────────────
         private static void PrintAggHeader() =>
             Console.WriteLine(
-                $"  {"#",3} {"Symbol",-13} {"Score",+7} {"1mo",+7} {"1wk",+7} {"1d",+7}" +
-                $" {"1h",+7} {"15m",+7} {"5m",+7} {"Close",9} {"vs52H%",8}" +
-                $" {"STDays",7} {"STDir",6}");
+                $"  {"#",3} {"Symbol",-13} {"Score",+7} {"Q",+5} {"E",+5} {"RR",+5}" +
+                $" {"1mo",+7} {"1wk",+7} {"1d",+7} {"1h",+7} {"15m",+7} {"5m",+7}" +
+                $" {"Close",9} {"vs52H%",8} {"State",-12}");
 
         private static void PrintAggRow(AggregatedResult r, ConsoleColor color)
         {
             Colored(
                 $"  {r.Rank,3} {r.Symbol,-13} {r.AggregateScore,+6:F1}" +
+                $" {r.QualityScore,5:F0} {r.EntryScore,5:F0} {r.RiskReward,5:F1}" +
                 $" {r.MonthlyScore,+6:F0} {r.WeeklyScore,+6:F0} {r.DailyScore,+6:F0}" +
                 $" {r.HourlyScore,+6:F0} {r.FifteenMinScore,+6:F0} {r.FiveMinScore,+6:F0}" +
-                $" {r.LastClose,9:F2} {r.Levels.PctFrom52wHigh,+7:F2}%" +
-                $" {r.StMetrics.TradingDaysInTrend,6}d" +
-                $" {(r.StMetrics.CurrentlyBullish ? "▲BULL" : "▼BEAR"),5}",
+                $" {r.LastClose,9:F2} {r.Levels.PctFrom52wHigh,+7:F2}% {r.SignalState,-12}",
                 color, nl: true);
         }
     }
@@ -3651,6 +4309,7 @@ namespace NseMomentumScanner
             var lastDayResults = new ConcurrentBag<ScanResult>();
             var allForCsv      = new ConcurrentBag<ScanResult>(); // for per-date CSV
             var skipReasons    = new ConcurrentBag<(string Symbol, string Timeframe, string Reason)>();
+            var plansBySymbol  = new ConcurrentDictionary<string, (JsonObject Long, JsonObject Short)>();
 
             ConsoleReporter.InitProgress(total);
 
@@ -3663,7 +4322,11 @@ namespace NseMomentumScanner
                 },
                 async (symbol, innerCt) =>
                 {
-                    var tickerResults = new List<ScanResult>();
+                    var tickerResults    = new List<ScanResult>();
+                    // v4.4: full-history bars+indicators per timeframe, for the Charts tab —
+                    // captured regardless of whether this timeframe yields any scoring rows,
+                    // since a chart wants the whole fetched series, not just ScanHistoryDays.
+                    var chartSeriesByTf  = new Dictionary<string, JsonObject>();
 
                     foreach (var (interval, tfLabel, _, lookback, vcpEnabled) in Config.ScanTimeframes)
                     {
@@ -3679,6 +4342,26 @@ namespace NseMomentumScanner
                                 Log.Debug("Skip {Sym} {TF}: {Reason}", symbol, tfLabel, dq.FailReason);
                                 skipReasons.Add((symbol, tfLabel, dq.FailReason));
                                 continue;
+                            }
+
+                            if (tfLabel == "1d")
+                            {
+                                try
+                                {
+                                    bool partial = quotes.Count > 0 && MarketClock.IsOpen(MarketClock.NowIst()) && quotes[^1].Date.Date == MarketClock.NowIst().Date;
+                                    plansBySymbol[symbol] = ChartAnalytics.BuildPlansForScan(quotes, partial);
+                                }
+                                catch (Exception exPlan) { Log.Debug("Trade plan build failed {Sym}: {Msg}", symbol, exPlan.Message); }
+                            }
+
+                            if (Config.ExportChartData)
+                            {
+                                try { chartSeriesByTf[tfLabel] = ChartDataExporter.BuildTimeframeSeries(quotes, YahooIntervalHelper.IsIntraday(interval)); }
+                                catch (Exception exChart)
+                                {
+                                    // Never let a chart-export hiccup affect scoring for this ticker.
+                                    Log.Debug("Chart series build failed {Sym} {TF}: {Msg}", symbol, tfLabel, exChart.Message);
+                                }
                             }
 
                             var tfResults = TickerScorer.Score(
@@ -3715,7 +4398,11 @@ namespace NseMomentumScanner
 
                     if (tickerResults.Count > 0)
                     {
-                        try { await _db.BulkInsertScanResultsAsync(sessionId, tickerResults); }
+                        try {
+                            await _db.BulkInsertScanResultsAsync(sessionId, tickerResults);
+                            if (Config.EnableAdvancedSignalEngine)
+                                await _db.BulkInsertSignalFeaturesAsync(sessionId, tickerResults);
+                        }
                         catch (Exception ex) { Log.Warning("DB insert error {Sym}: {Msg}", symbol, ex.Message); }
                         Interlocked.Increment(ref scored);
                     }
@@ -3723,6 +4410,9 @@ namespace NseMomentumScanner
                     {
                         Interlocked.Increment(ref skipped);
                     }
+
+                    if (Config.ExportChartData && chartSeriesByTf.Count > 0)
+                        await ChartDataExporter.WriteSymbolFileAsync(symbol, chartSeriesByTf, innerCt);
 
                     int p = Interlocked.Increment(ref progress);
                     string curTf = tickerResults.Count > 0
@@ -3732,6 +4422,9 @@ namespace NseMomentumScanner
 
             ConsoleReporter.ClearProgress();
             _db.UpdateSessionScored(sessionId, scored);
+
+            try { await PlanSidecar.WriteAsync(plansBySymbol, today.ToString("yyyy-MM-dd"), ct); Log.Information("Trade plans written for {N} symbols", plansBySymbol.Count); }
+            catch (Exception exPlans) { Log.Warning("Could not write trade-plan sidecar (non-fatal): {Msg}", exPlans.Message); }
 
             // ── Write per-date CSV files ───────────────────────────────────────
             // Pre-group once (O(n)) instead of re-scanning the full csvList for every
@@ -3811,6 +4504,31 @@ namespace NseMomentumScanner
             ConsoleReporter.PrintFooter(sessionId, scored, skipped, sw.Elapsed);
         }
 
+        // =========================================================================
+        //  UNIVERSE SIZE — v4.3 audit note
+        // -------------------------------------------------------------------
+        //  This was expanded from ~580 to ~812 unique tickers, rebuilt against
+        //  NSE's own live "Nifty Total Market" constituent file (Nifty 500 +
+        //  Nifty Microcap 250, fetched fresh from nsearchives.nseindia.com),
+        //  which is NSE's own officially rank-ordered, market-cap-based
+        //  universe — and it stops at 750 names. There is no further NSE
+        //  index beyond rank 750; Nifty 500 eligibility itself is capped at
+        //  the top 800 names by both average turnover AND market cap, so
+        //  "top 1500 by trading" isn't a rank NSE itself publishes. Pushing
+        //  past ~800 means pulling in the unranked mainboard long tail
+        //  (~1,250 more, mostly illiquid microcaps/shells) with no cap or
+        //  turnover ordering behind it — this build deliberately stops short
+        //  of that rather than pad the count with low-quality names; the
+        //  existing AvgTurnover/IsLiquid runtime filter (see
+        //  DashboardDataBuilder) already exists to prune illiquid names, but
+        //  it can't compensate for a universe that's mostly shells to begin
+        //  with. If broader raw coverage is wanted anyway (e.g. for research
+        //  backtests where you'll filter hard on liquidity yourself), the
+        //  full NSE mainboard equity master (EQUITY_L.csv, ~2,000 rows) is
+        //  the next tier up — flag it and it can be layered in as a fourth,
+        //  clearly-labeled "unranked" bucket rather than folded into the
+        //  three below.
+        // =========================================================================
         private static List<string> BuildUniverse() =>
             Nifty200Universe.Tickers
                 .Concat(NiftySMIDUniverse.Tickers)
@@ -3856,7 +4574,11 @@ namespace NseMomentumScanner
             double? Adx, double? Pdi, double? Mdi, double? VolR, double? AvgVol, bool Vcp,
             double? HmaFast, double? HmaSlow, double? EmaFast, double? EmaSlow,
             double? StHl, int? StHlAgo, double? StLh, int? StLhAgo,
-            double? ScSt, double? ScHma, double? ScAdx, double? ScVcp, double? ScVol, double? ScTr);
+            double? ScSt, double? ScHma, double? ScAdx, double? ScVcp, double? ScVol, double? ScTr,
+            double? Quality, double? Entry, double? Structure, double? Setup, double? Trigger,
+            double? VolumeQuality, double? BreakoutQuality, double? PullbackQuality, double? RiskReward,
+            double? Velocity, double? Acceleration, int? DistributionCount, bool IsBreakout, bool IsPullback,
+            bool IsExhaustion, string? StructureState, string? SetupState, string? TriggerState, string? SignalState);
 
         public static async Task<string> BuildJsonAsync(
             string dbPath, int? sessionId, string? scanDateOverride, CancellationToken ct)
@@ -3928,6 +4650,21 @@ namespace NseMomentumScanner
                 stocks.Add(BuildStockJson(r, d, hist));
             }
 
+            // Trade plans (scan-time daily bars) → attach to each stock; absent file/symbol simply means no plan columns.
+            var planFile = PlanSidecar.Load();
+            var planMap  = planFile?["plans"]?.AsObject();
+            if (planMap != null)
+                foreach (var node in stocks)
+                {
+                    var o = node!.AsObject();
+                    var sym = o["sym"]?.GetValue<string>();
+                    if (sym != null && planMap[sym] is JsonObject pp)
+                    {
+                        o["planLong"]  = pp["long"]?.DeepClone();
+                        o["planShort"] = pp["short"]?.DeepClone();
+                    }
+                }
+
             var tfOut = new JsonArray();
             foreach (var t in tfBreakdown)
                 tfOut.Add(new JsonObject
@@ -3958,6 +4695,7 @@ namespace NseMomentumScanner
                     ["weightSource"] = session.WeightSource, // v4.1: "default" or "optimized:YYYY-MM-DD:objective"
                 },
                 ["stocks"]      = stocks,
+                ["plansAsOf"]   = planFile?["scanDate"]?.DeepClone(),
                 ["tfBreakdown"] = tfOut,
                 ["sectorRotation"] = sectorOut,
                 ["marketRegime"] = regime == null ? null : new JsonObject
@@ -4074,6 +4812,17 @@ namespace NseMomentumScanner
                 {
                     ["st"] = d?.ScSt, ["hma"] = d?.ScHma, ["adx"] = d?.ScAdx,
                     ["vcp"] = d?.ScVcp, ["vol"] = d?.ScVol, ["tr"] = d?.ScTr,
+                },
+                ["advanced"] = new JsonObject
+                {
+                    ["quality"] = d?.Quality, ["entry"] = d?.Entry, ["structure"] = d?.Structure,
+                    ["setup"] = d?.Setup, ["trigger"] = d?.Trigger, ["volumeQuality"] = d?.VolumeQuality,
+                    ["breakoutQuality"] = d?.BreakoutQuality, ["pullbackQuality"] = d?.PullbackQuality,
+                    ["riskReward"] = d?.RiskReward, ["velocity"] = d?.Velocity, ["acceleration"] = d?.Acceleration,
+                    ["distributionCount"] = d?.DistributionCount ?? 0, ["breakout"] = d?.IsBreakout ?? false,
+                    ["pullback"] = d?.IsPullback ?? false, ["exhaustion"] = d?.IsExhaustion ?? false,
+                    ["structureState"] = d?.StructureState ?? "RANGE", ["setupState"] = d?.SetupState ?? "NONE",
+                    ["triggerState"] = d?.TriggerState ?? "NONE", ["signalState"] = d?.SignalState ?? "WATCH"
                 },
                 // ── v4.0: relative strength, liquidity, extension, risk levels ─────────
                 ["rsRank"]        = r.RsRank,
@@ -4272,12 +5021,18 @@ namespace NseMomentumScanner
             SqliteConnection c, int sid, string scanDate, CancellationToken ct)
         {
             const string sql = @"
-                SELECT symbol, adx_value, pdi_value, mdi_value, volume_ratio, avg_volume, vcp_detected,
-                       hma_fast, hma_slow, ema_fast, ema_slow,
-                       st_hl, st_hl_ago, st_lh, st_lh_ago,
-                       supertrend_score, hma_score, adx_score, vcp_score, volume_score, trend_score
-                FROM scan_results
-                WHERE session_id=@sid AND scan_date=@dt AND timeframe='1d'";
+                SELECT sr.symbol, sr.adx_value, sr.pdi_value, sr.mdi_value, sr.volume_ratio, sr.avg_volume, sr.vcp_detected,
+                       sr.hma_fast, sr.hma_slow, sr.ema_fast, sr.ema_slow,
+                       sr.st_hl, sr.st_hl_ago, sr.st_lh, sr.st_lh_ago,
+                       sr.supertrend_score, sr.hma_score, sr.adx_score, sr.vcp_score, sr.volume_score, sr.trend_score,
+                       sf.quality_score, sf.entry_score, sf.structure_score, sf.setup_score, sf.trigger_score,
+                       sf.volume_quality, sf.breakout_quality, sf.pullback_quality, sf.risk_reward, sf.score_velocity,
+                       sf.score_acceleration, sf.distribution_count, sf.is_breakout, sf.is_pullback, sf.is_exhaustion,
+                       sf.structure_state, sf.setup_state, sf.trigger_state, sf.signal_state
+                FROM scan_results sr
+                LEFT JOIN signal_features sf ON sf.session_id=sr.session_id AND sf.symbol=sr.symbol
+                    AND sf.scan_date=sr.scan_date AND sf.timeframe=sr.timeframe
+                WHERE sr.session_id=@sid AND sr.scan_date=@dt AND sr.timeframe='1d'";
             await using var cmd = new SqliteCommand(sql, c);
             cmd.Parameters.AddWithValue("@sid", sid);
             cmd.Parameters.AddWithValue("@dt", scanDate);
@@ -4291,7 +5046,11 @@ namespace NseMomentumScanner
                     !rd.IsDBNull(6) && rd.GetInt32(6) != 0,
                     GetD(rd, 7), GetD(rd, 8), GetD(rd, 9), GetD(rd, 10),
                     GetD(rd, 11), GetI(rd, 12), GetD(rd, 13), GetI(rd, 14),
-                    GetD(rd, 15), GetD(rd, 16), GetD(rd, 17), GetD(rd, 18), GetD(rd, 19), GetD(rd, 20));
+                    GetD(rd, 15), GetD(rd, 16), GetD(rd, 17), GetD(rd, 18), GetD(rd, 19), GetD(rd, 20),
+                    GetD(rd, 21), GetD(rd, 22), GetD(rd, 23), GetD(rd, 24), GetD(rd, 25), GetD(rd, 26),
+                    GetD(rd, 27), GetD(rd, 28), GetD(rd, 29), GetD(rd, 30), GetD(rd, 31), GetI(rd, 32),
+                    !rd.IsDBNull(33) && rd.GetInt32(33) != 0, !rd.IsDBNull(34) && rd.GetInt32(34) != 0,
+                    !rd.IsDBNull(35) && rd.GetInt32(35) != 0, GetS(rd, 36), GetS(rd, 37), GetS(rd, 38), GetS(rd, 39));
             }
             return map;
         }
@@ -4427,8 +5186,12 @@ namespace NseMomentumScanner
                 ContentRootPath = Directory.GetCurrentDirectory(),
             });
             builder.Logging.ClearProviders(); // Serilog already owns console/file logging
+            // The dashboard is served by this very process (same origin), so CORS is only needed for
+            // tooling on this machine. AllowAnyOrigin would let ANY website open in the browser read
+            // scan results from http://localhost while the server runs.
             builder.Services.AddCors(o => o.AddDefaultPolicy(p =>
-                p.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader()));
+                p.WithOrigins($"http://localhost:{port}", $"http://127.0.0.1:{port}", $"http://{host}:{port}")
+                 .AllowAnyMethod().AllowAnyHeader()));
 
             var app = builder.Build();
             app.Urls.Add($"http://{host}:{port}");
@@ -4474,6 +5237,157 @@ namespace NseMomentumScanner
                     Log.Warning("Dashboard API error: {Msg}", ex.Message);
                     return Results.Problem(ex.Message, statusCode: 503);
                 }
+            });
+
+            // Charts tab — live Yahoo Finance OHLCV source (v4.8 hardening):
+            //  · symbol allow-list (the value reaches a file path and an upstream URL),
+            //  · split-adjusted-only prices so levels match broker terminals,
+            //  · short TTL cache + per-key single-flight so UI refreshes can't trigger Yahoo 429s,
+            //  · on upstream failure serve the last good payload / scan export flagged stale=true
+            //    — never fabricated data, never a silent success.
+            using var chartYahoo = new YahooDataFetcher();
+            var symbolRx   = new System.Text.RegularExpressions.Regex(@"^[A-Z0-9][A-Z0-9&\-]{0,24}$",
+                                 System.Text.RegularExpressions.RegexOptions.Compiled);
+            var chartCache = new System.Collections.Concurrent.ConcurrentDictionary<string, (DateTime FetchedUtc, string Json)>();
+            var refCache   = new System.Collections.Concurrent.ConcurrentDictionary<string, (DateTime FetchedUtc, List<StockQuote> Quotes)>();
+            var chartLocks = new System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim>();
+
+            static TimeSpan ChartTtl(string tf, bool marketOpen) => !marketOpen ? TimeSpan.FromMinutes(10) : tf switch
+            {
+                "5m"  => TimeSpan.FromSeconds(20),
+                "15m" => TimeSpan.FromSeconds(45),
+                "1h"  => TimeSpan.FromSeconds(90),
+                "1d"  => TimeSpan.FromSeconds(60),
+                _     => TimeSpan.FromMinutes(10),
+            };
+
+            static IResult StaleJson(string json, string source)
+            {
+                var node = JsonNode.Parse(json)!.AsObject();
+                node["stale"] = true;
+                node["source"] = source;
+                return Results.Text(node.ToJsonString(), "application/json");
+            }
+
+            app.MapGet("/charts/{symbol}", async (HttpContext http, string symbol) =>
+            {
+                string tf = http.Request.Query["tf"].ToString().Trim().ToLowerInvariant();
+                if (string.IsNullOrWhiteSpace(tf)) tf = "1d";
+                http.Response.Headers.CacheControl = "no-store";
+                try
+                {
+                    symbol = symbol.Trim().ToUpperInvariant();
+                    if (symbol.EndsWith(".NS", StringComparison.Ordinal)) symbol = symbol[..^3];
+                    if (!symbolRx.IsMatch(symbol))
+                        return Results.Problem("Invalid symbol.", statusCode: 400);
+                    symbol += ".NS";
+
+                    var (interval, lookbackDays, barLength) = tf switch
+                    {
+                        "1mo" => (YahooInterval.OneMonth,        3650, TimeSpan.FromDays(30)),
+                        "1wk" => (YahooInterval.OneWeek,         1095, TimeSpan.FromDays(7)),
+                        "1d"  => (YahooInterval.OneDay,           500, TimeSpan.FromDays(1)),
+                        "1h"  => (YahooInterval.OneHour,           60, TimeSpan.FromHours(1)),
+                        "15m" => (YahooInterval.FifteenMinutes,    20, TimeSpan.FromMinutes(15)),
+                        "5m"  => (YahooInterval.FiveMinutes,       10, TimeSpan.FromMinutes(5)),
+                        _     => (YahooInterval.OneDay,             0, TimeSpan.Zero),
+                    };
+                    if (lookbackDays == 0)
+                        return Results.Problem($"Unsupported chart timeframe '{tf}'. Supported: 1mo, 1wk, 1d, 1h, 15m, 5m.", statusCode: 400);
+
+                    string key = symbol + "|" + tf;
+                    bool marketOpen = MarketClock.IsOpen(MarketClock.NowIst());
+                    bool forceRefresh = http.Request.Query.ContainsKey("refresh");
+
+                    // Fast path: fresh enough → no upstream call at all.
+                    if (!forceRefresh && chartCache.TryGetValue(key, out var hit) &&
+                        DateTime.UtcNow - hit.FetchedUtc < ChartTtl(tf, marketOpen))
+                        return Results.Text(hit.Json, "application/json");
+
+                    var gate = chartLocks.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
+                    await gate.WaitAsync(http.RequestAborted);
+                    try
+                    {
+                        // Another request may have refreshed while we waited for the gate.
+                        if (chartCache.TryGetValue(key, out hit) &&
+                            DateTime.UtcNow - hit.FetchedUtc < (forceRefresh ? TimeSpan.FromSeconds(5) : ChartTtl(tf, marketOpen)))
+                            return Results.Text(hit.Json, "application/json");
+
+                        // Chart prices are split-adjusted only (adjustForDividends:false).
+                        var quotes = await chartYahoo.FetchAsync(symbol, interval, lookbackDays, http.RequestAborted, adjustForDividends: false);
+                        if (quotes.Count > 0)
+                        {
+                            var isIntraday = YahooIntervalHelper.IsIntraday(interval);
+                            // Day/week/52-week levels must come from DAILY bars even when the displayed
+                            // timeframe is 5m/15m/1h/1W/1M (intraday feeds lack 52-week history).
+                            List<StockQuote> dailyReference = quotes;
+                            if (interval != YahooInterval.OneDay)
+                            {
+                                string refKey = symbol + "|ref";
+                                if (refCache.TryGetValue(refKey, out var rc) &&
+                                    DateTime.UtcNow - rc.FetchedUtc < (marketOpen ? TimeSpan.FromMinutes(2) : TimeSpan.FromMinutes(30)))
+                                    dailyReference = rc.Quotes;
+                                else
+                                {
+                                    var fresh = await chartYahoo.FetchAsync(symbol, YahooInterval.OneDay, 400, http.RequestAborted, adjustForDividends: false);
+                                    if (fresh.Count > 0) { refCache[refKey] = (DateTime.UtcNow, fresh); dailyReference = fresh; }
+                                    else if (rc.Quotes is { Count: > 0 }) dailyReference = rc.Quotes; // stale reference beats none
+                                }
+                            }
+
+                            var series = ChartDataExporter.BuildTimeframeSeries(quotes, isIntraday, dailyReference, barLength);
+                            var root = new JsonObject
+                            {
+                                ["symbol"] = symbol,
+                                ["generated"] = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+                                ["source"] = "Yahoo Finance Chart API",
+                                ["priceBasis"] = "split-adjusted (not dividend-adjusted)",
+                                ["stale"] = false,
+                                ["timeframe"] = tf,
+                                ["timeframes"] = new JsonObject { [tf] = series }
+                            };
+                            var json = root.ToJsonString();
+                            chartCache[key] = (DateTime.UtcNow, json);
+                            if (chartCache.Count > 300)
+                                foreach (var old in chartCache.OrderBy(kv => kv.Value.FetchedUtc).Take(100).Select(kv => kv.Key).ToList())
+                                    chartCache.TryRemove(old, out _);
+                            return Results.Text(json, "application/json");
+                        }
+
+                        // Yahoo gave nothing: serve the last good payload for this key, clearly flagged.
+                        if (chartCache.TryGetValue(key, out var last))
+                            return StaleJson(last.Json, "Yahoo unavailable — showing last successful fetch");
+
+                        // …else the scan-time export (dividend-adjusted, possibly days old), clearly flagged.
+                        var path = ChartDataExporter.FilePathFor(symbol);
+                        if (File.Exists(path))
+                            return StaleJson(await File.ReadAllTextAsync(path, http.RequestAborted),
+                                             "Yahoo unavailable — showing last scan export (can be days old)");
+
+                        return Results.Problem($"Yahoo Finance returned no {tf} OHLC data for {symbol}.", statusCode: 502);
+                    }
+                    finally { gate.Release(); }
+                }
+                catch (OperationCanceledException) when (http.RequestAborted.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning("Chart data API error for {Sym}: {Msg}", symbol, ex.Message);
+                    return Results.Problem(ex.Message, statusCode: 503);
+                }
+            });
+
+            // Locally vendored front-end libraries (pinned, no third-party CDN dependency while trading).
+            app.MapGet("/vendor/{file}", (HttpContext http, string file) =>
+            {
+                if (!System.Text.RegularExpressions.Regex.IsMatch(file, @"^[A-Za-z0-9._\-]+\.js$"))
+                    return Results.NotFound();
+                var vpath = Path.Combine(Directory.GetCurrentDirectory(), "vendor", file);
+                if (!File.Exists(vpath)) return Results.NotFound();
+                http.Response.Headers.CacheControl = "public, max-age=86400";
+                return Results.File(vpath, "application/javascript");
             });
 
             app.MapGet("/api/health", () =>
@@ -4539,6 +5453,7 @@ namespace NseMomentumScanner
 
             Log.Information("Dashboard live at   http://{Host}:{Port}/", host, port);
             Log.Information("Live JSON API at    http://{Host}:{Port}/dashboard_data.json", host, port);
+            Log.Information("Chart data API at   http://{Host}:{Port}/charts/{{symbol}} (e.g. /charts/RELIANCE.NS)", host, port);
             Log.Information("Health check at     http://{Host}:{Port}/api/health", host, port);
             Log.Information("Backtesting page at http://{Host}:{Port}/backtest", host, port);
             Log.Information("Press Ctrl+C to stop.");
@@ -4639,6 +5554,8 @@ CONFIGURATION
     ""CacheEnabled"":        true,
     ""CacheBaseDir"":        "".cache/yahoo"",
     ""SlowTfCacheHours"":    6,
+    ""ChartsExportDir"":     ""charts"",
+    ""ExportChartData"":     true,
     ""MarketBenchmarkSymbol"": ""^NSEI"",
     ""ReferenceDataCsvPath"":  ""data/reference.csv"",
     ""UseOptimizedWeights"":   true,

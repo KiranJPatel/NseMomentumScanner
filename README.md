@@ -1,4 +1,57 @@
-# NSE Momentum Stock Scanner — Production v4.3
+
+## v4.5 Chart Enhancements
+
+The Dashboard **Charts** tab now uses the scanner's server-side Yahoo Finance Chart API integration for chart OHLCV data instead of relying on scan-exported files. The browser never calls Yahoo directly; the .NET dashboard server calls Yahoo Finance using the same retry, rate-limit, parsing and adjusted-data handling already used by the scanner.
+
+Supported chart intervals: `1mo`, `1wk`, `1d`, `1h`, `15m`, `5m`. Data is loaded lazily one timeframe at a time to avoid downloading all intervals unnecessarily. The previous scan-exported chart JSON remains a fallback if Yahoo temporarily returns no data.
+
+The stock detail modal and Charts toolbar now include **Open Scanner Chart / Popout**. This opens the selected symbol in a separate browser window with the dashboard chrome hidden, leaving a clean candlestick chart that can be closed normally.
+
+# NSE Momentum Scanner v4.5 — Contextual Signal Engine
+
+This release preserves the v4.4 production scanner and adds a contextual signal layer focused on signal quality rather than indicator count.
+
+## v4.5 highlights
+- Live/backtest benchmark parity for historical RS and market regime.
+- Continuous trend, structure and volume quality metrics.
+- HH/HL/LH/LL structure classification.
+- Breakout, pullback and VCP setup quality.
+- Setup vs trigger state machine.
+- RVOL baseline excludes the current bar.
+- Distribution/exhaustion detection.
+- Quality Score, Entry Score, Risk/Reward, score velocity and acceleration.
+- Advanced BUY/SELL gates with configurable thresholds.
+- `signal_features` SQLite journal; existing v4.4 tables are retained.
+- Dashboard JSON exposes the new `advanced` signal payload.
+- Backtest timeframe-coherence gate now scales to the configured timeframes.
+
+See the v4.4 sections below for all existing functionality and configuration.
+
+# NSE Momentum Stock Scanner — Production v4.4
+
+## What's new in v4.4 (Charts tab — candlesticks + every indicator, TradingView-style)
+
+**What was missing:** the dashboard could tell you a stock scored well, but not *show* you
+why — no price chart existed anywhere in the UI, and the DB never persisted full OHLCV
+history to begin with (only the last bar's snapshot per symbol/timeframe). Adding a chart
+tab meant adding an export path first, not just a new panel.
+
+| Change | Detail |
+|--------|--------|
+| **`ChartDataExporter`** (new) | Builds one JSON file per symbol — all 6 timeframes bundled together — straight from the `quotes` + indicator series already in memory during a normal scan. No extra Yahoo calls, no new DB table/migration. `IndicatorArrays.Compute()` runs a second time per (symbol, timeframe) purely for this export (cheap, O(bars), not a network call) so `TickerScorer.Score`'s signature — shared with `Backtesting/BacktestEngine.cs` — never had to change. |
+| **`GET /charts/{symbol}`** | New explicit route on `DashboardServer`, same pattern as `/dashboard_data.json` (not blanket static-file serving — see the code comment on why that's deliberate). 404s with a clear message if that symbol hasn't been scanned yet. |
+| **`ChartsExportDir` / `ExportChartData`** (new config) | Directory defaults to `charts/`; the export can be switched off in `appsettings.json` if the extra per-scan disk I/O (~800 small files) isn't wanted on a given run — the Charts tab just serves whatever it last wrote until the next scan with exporting enabled. |
+| **New "Charts" tab in `nse_dashboard.html`** | Candlesticks + volume in the main pane, with ADX/+DI/-DI and ATR in their own synced sub-panes below (scroll/zoom one, all three move together). Every indicator the scanner computes is rendered: EMA fast/slow, HMA fast/slow, Supertrend (colour-flips with the regime), ADX/+DI/-DI, ATR, volume — each toggleable. Symbol search covers every stock currently loaded (live or demo), with a timeframe switcher matching the scanner's own 1M/1W/1D/1H/15m/5m. |
+| **Charting library: TradingView's own [Lightweight Charts](https://github.com/tradingview/lightweight-charts) (v4, via CDN)** | The literal "best fit" for a TradingView-style screen — free, MIT-licensed, purpose-built for candlesticks + overlays, and what TradingView itself ships for embedded charts. Pinned to the stable v4 API rather than v5 (which changed the series-creation API) since this couldn't be compiled/run in-repo to verify against a newer surface. |
+| **Demo-mode fallback** | Opened via `file://`, or a symbol that hasn't been scanned yet: the tab generates a synthetic candle series and runs the *same* indicator formulas (EMA, WMA/HMA, Wilder ATR & ADX, ATR-band Supertrend) client-side against it, so the demo looks internally consistent rather than randomly overlaid lines — and is labelled "Demo chart" so it's never mistaken for real data. |
+
+**Caveat worth knowing:** the client-side demo indicator math is a from-scratch JS
+reimplementation for visual purposes only — it exists purely so the tab isn't broken/empty
+without a live scan running, and was never meant to be, and should never be treated as,
+authoritative. Every real (non-demo) value in the Charts tab still comes from the same
+Skender.Stock.Indicators computation the rest of the scanner already trusts for scoring.
+
+---
 
 ## What's new in v4.3 (scan speed: ~6-8 min → ~2-3 min)
 
@@ -238,11 +291,18 @@ built-in demo data so you can still explore the UI.
   "ShockerTopCount": 25,
   "ShockerMinPriceInr": null,
   "ConsecutiveDailyMinStreak": 3,
-  "ConsecutiveWeeklyMinStreak": 2
+  "ConsecutiveWeeklyMinStreak": 2,
+
+  "ChartsExportDir": "charts",
+  "ExportChartData": true
 }
 ```
 `ShockerMinPriceInr: null` means "use `MinPriceInr`'s value" (the same floor the live BUY
 gate uses) — set an explicit number to give the Shockers panels their own floor.
+
+`ExportChartData: false` skips writing the per-symbol chart JSON files entirely (see v4.4
+above) — useful if you want a faster/lighter scan on a given run and don't need the Charts
+tab refreshed until later; it'll keep serving whatever it last wrote.
 
 ---
 
@@ -272,6 +332,10 @@ data/
   scan_YYYY-MM-DD_1wk.csv
   aggregated_YYYY-MM-DD.csv    ← cross-TF composite scores + recommendations
 dashboard_data.json            ← generated by export_dashboard_data.py
+charts/
+  RELIANCE.NS.json             ← one file per symbol (v4.4) — all 6 TFs' OHLCV +
+  TCS.NS.json                    indicator series, written by ChartDataExporter each
+  ...                           scan, served at GET /charts/{symbol} for the Charts tab
 ```
 
 ---
@@ -298,6 +362,7 @@ dashboard_data.json            ← generated by export_dashboard_data.py
 | Supertrend | Days in trend · Last flip · HH / HL / LH / LL + days-ago |
 | Shockers *(v4.2)* | Price gainers/losers + volume shockers, four rolling windows (1D/3D/1W/1M) |
 | Streaks *(v4.2)* | Stocks on a consecutive daily (3+) or weekly (2+) up/down closing streak |
+| Charts *(v4.4)* | TradingView-style candlesticks for any scanned stock, any of the 6 timeframes, with every computed indicator overlaid (EMA, HMA, Supertrend, ADX/DI, ATR, volume) — see "What's new in v4.4" above |
 
 Click any row for a full stock detail modal with score breakdown,
 range meters, supertrend analysis, and links to NSE + Yahoo charts.
@@ -636,3 +701,18 @@ on out-of-sample data, not a proof.
 
 
 
+
+## Chart engine upgrade
+
+The Charts tab now uses Yahoo Finance OHLC as the source of truth and recalculates chart indicators from the exact same sorted OHLC timestamp series in the browser. Intraday chart epochs are kept as absolute Unix timestamps and formatted as Asia/Kolkata, avoiding the previous double time-zone shift.
+
+Added:
+- Industry-standard seeded EMA, Wilder RMA/ATR, Wilder ADX/+DI/-DI, WMA/HMA and Supertrend calculations.
+- Previous-day H/L, current-session H/L, current-week H/L and current-month H/L.
+- Weekly S1/R1/S2/R2 levels and shaded support/resistance zones.
+- Bullish/bearish three-candle Fair Value Gap detection with fill-aware extension.
+- Crosshair/click analytical popover containing OHLC, volume, RVOL, indicators and key levels.
+- Popover automatically stays at least 100px from the cursor and moves left/right based on cursor position; 25% transparent themed background with backdrop blur.
+- Dynamic candle density based on available chart width, with saved zoom density.
+- IndexedDB persistence for symbol, timeframe, indicator visibility, indicator settings and zoom layout.
+- Configurable indicator periods and FVG/zone thresholds from the chart Settings dialog.

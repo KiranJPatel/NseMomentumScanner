@@ -77,6 +77,27 @@ namespace NseMomentumScanner.Backtesting
             int fetched = 0, skippedTickers = 0, cacheHits = 0;
             DateTime dailyEarliestNeeded = DateTime.Today.AddDays(-dailyLookback);
 
+            // v4.5: benchmark is part of the historical strategy, not just the live scanner.
+            // Fetch it once and pass the as-of-date close map into the exact same scorer used by
+            // live mode. This removes the v4.4 live/backtest parity gap for RS and market context.
+            List<StockQuote> benchmarkQuotes = new();
+            Dictionary<DateTime, decimal> benchmarkCloseByDate = new();
+            Dictionary<DateTime, MarketRegimeInfo> historicalRegimes = new();
+            try
+            {
+                benchmarkQuotes = await fetcher.FetchAsync(Config.MarketBenchmarkSymbol, YahooInterval.OneDay,
+                    Math.Max(dailyLookback, Config.MarketRegimeLookbackDays), ct);
+                foreach (var q in benchmarkQuotes) benchmarkCloseByDate[q.Date.Date] = q.Close;
+                historicalRegimes = MarketRegimeAnalyzer.BuildHistoricalSnapshots(benchmarkQuotes, startDate, endDate);
+                Log.Information("Backtest benchmark context ready: {Sym}, {Bars} bars, {Regimes} historical regimes.",
+                    Config.MarketBenchmarkSymbol, benchmarkQuotes.Count, historicalRegimes.Count);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning("Backtest benchmark fetch failed ({Sym}): {Msg} — RS/regime gates will degrade gracefully.",
+                    Config.MarketBenchmarkSymbol, ex.Message);
+            }
+
             await Parallel.ForEachAsync(tickers,
                 new ParallelOptions { MaxDegreeOfParallelism = Config.MaxConcurrentFetches, CancellationToken = ct },
                 async (symbol, innerCt) =>
@@ -159,7 +180,7 @@ namespace NseMomentumScanner.Backtesting
                             if (!dq.IsValid) continue;
 
                             var results = TickerScorer.Score(
-                                symbol, tf.Interval, tf.Label, tf.VcpEnabled, quotes, startDate, endDate);
+                                symbol, tf.Interval, tf.Label, tf.VcpEnabled, quotes, startDate, endDate, benchmarkCloseByDate);
                             foreach (var r in results) allScanResults.Add(r);
                         }
                         catch (OperationCanceledException) { throw; }
@@ -267,7 +288,8 @@ namespace NseMomentumScanner.Backtesting
                 // today's close/indicators, queued for execution at tomorrow's open.
                 if (!resultsByDate.TryGetValue(day.Date, out var todaysResults))
                     todaysResults = EmptyScanResults;
-                var aggToday = MultiTfAggregator.Aggregate(todaysResults, day);
+                historicalRegimes.TryGetValue(day.Date, out var regimeToday);
+                var aggToday = MultiTfAggregator.Aggregate(todaysResults, day, regimeToday);
                 var sellSignalSymbols = aggToday
                     .Where(a => a.RecommendationType == "IMMEDIATE_SELL")
                     .Select(a => a.Symbol)

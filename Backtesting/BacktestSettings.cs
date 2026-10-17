@@ -2,7 +2,7 @@
 //  BACKTESTING MODULE · BacktestSettings
 // -----------------------------------------------------------------------------
 //  Reads the "Backtest" section of appsettings.json (completely independent of
-//  the existing AppSettings/Config classes — nothing here touches scanner
+//  the existing Program.AppSettings/Config classes — nothing here touches scanner
 //  configuration). Falls back to sane compile-time defaults when a field is
 //  missing, exactly like the existing Config class does for the scanner.
 // =============================================================================
@@ -140,7 +140,7 @@ namespace NseMomentumScanner.Backtesting
 
     /// <summary>Resolved, ready-to-use backtest configuration — compile-time defaults, all
     /// overridable via appsettings.json → "Backtest" section. Mirrors the existing scanner's
-    /// AppSettings→Config pattern.</summary>
+    /// Program.AppSettings→Config pattern.</summary>
     internal static class BacktestConfig
     {
         private static BacktestJsonSettings _s = new();
